@@ -1,0 +1,16 @@
+{
+  "name": "tupuestito",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --parallel --filter \"./apps/*\" dev",
+    "build": "pnpm --filter \"./packages/*\" build && pnpm --filter \"./apps/*\" build",
+    "lint": "pnpm --recursive lint",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:studio": "pnpm --filter @tupuestito/api db:studio"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
+
