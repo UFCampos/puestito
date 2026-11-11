@@ -237,9 +237,11 @@ export default function ArtistProfilePage() {
                       <p className="font-bold text-purple-800">
                         {srv.paymentPlan === "FULL_100"
                           ? "💳 100% al aceptar"
+                          : srv.paymentPlan === "MILESTONES"
+                          ? `🧩 Pago en ${srv.milestones?.length ?? 0} etapas`
                           : srv.paymentPlan === "SPLIT_ON_SKETCH"
-                          ? "✨ 50% seña + 50% al aprobar Boceto"
-                          : "🛡️ 50% seña + 50% en Vista Previa Final"}
+                          ? "✨ 50% seña + 50% al aprobar el boceto"
+                          : "🛡️ 50% seña + 50% al aprobar la vista previa final"}
                       </p>
                     </div>
                     <div>
@@ -252,6 +254,22 @@ export default function ArtistProfilePage() {
                       </p>
                     </div>
                   </div>
+
+                  {srv.paymentPlan === "MILESTONES" && srv.milestones?.length > 0 && (
+                    <ol className="mt-3 space-y-1 rounded-xl border border-slate-100 p-3 text-xs text-slate-600">
+                      {srv.milestones.map((m: any, i: number) => (
+                        <li key={i} className="flex justify-between gap-3">
+                          <span className="truncate">
+                            <span className="font-bold text-slate-800">{i + 1}. {m.title}</span>
+                            {m.description ? ` — ${m.description}` : ""}
+                          </span>
+                          <span className="shrink-0 font-semibold text-purple-700">
+                            {m.percent}% · {m.days} d
+                          </span>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
 
                   {tagsList.length > 0 && (
                     <div className="mt-3 flex flex-wrap gap-1.5">

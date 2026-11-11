@@ -6,7 +6,9 @@ import { useRouter } from "next/navigation";
 import { apiFetch } from "@/lib/api";
 import { useAppConfig } from "@/lib/useAppConfig";
 
-type PaymentPlan = "FULL_100" | "SPLIT_ON_SKETCH" | "SPLIT_ON_FINAL_PREVIEW";
+type PaymentPlan = "FULL_100" | "SPLIT_ON_SKETCH" | "SPLIT_ON_FINAL_PREVIEW" | "MILESTONES";
+type PlanKind = "SPLIT" | "MILESTONES" | "FULL";
+type SplitTrigger = "SKETCH" | "FINAL_PREVIEW";
 type Rating = "SFW" | "SUGGESTIVE" | "NSFW";
 
 export interface ServiceDraft {
@@ -22,7 +24,16 @@ export interface ServiceDraft {
   rating: Rating;
   tags: string[];
   addons: { id?: string; name: string; priceArs: number }[];
+  milestones?: { title: string; description: string; percent: number; days: number }[];
   isActive?: boolean;
+}
+
+interface MilestoneRow {
+  key: string;
+  title: string;
+  description: string;
+  percent: string;
+  days: string;
 }
 
 interface AddonRow {
@@ -46,29 +57,26 @@ const RATING_OPTIONS: { value: Rating; title: string; text: string }[] = [
   { value: "NSFW", title: "NSFW +18", text: "Explícito. Solo lo ven adultos que lo activan." }
 ];
 
-const PLAN_OPTIONS: { value: PaymentPlan; title: string; badge?: string; steps: string[] }[] = [
+const SPLIT_TRIGGERS: { value: SplitTrigger; label: string; help: string }[] = [
   {
-    value: "SPLIT_ON_SKETCH",
-    title: "50% de seña + 50% al aprobar el boceto",
-    badge: "Recomendado",
-    steps: ["Cobrás el 50% al aceptar el pedido", "Subís el boceto", "Cobrás el otro 50% cuando lo aprueban", "Entregás el final"]
+    value: "SKETCH",
+    label: "aprobar el boceto",
+    help: "Cobrás el segundo 50% antes de pasar a línea y color. Entregás el final ya cobrado."
   },
   {
-    value: "SPLIT_ON_FINAL_PREVIEW",
-    title: "50% de seña + 50% al aprobar la vista previa final",
-    steps: [
-      "Cobrás el 50% al aceptar el pedido",
-      "Boceto y obra final",
-      "El comprador ve el final con marca de agua",
-      "Cobrás el otro 50% y se libera el original"
-    ]
-  },
-  {
-    value: "FULL_100",
-    title: "100% por adelantado",
-    steps: ["Cobrás el 100% al aceptar el pedido", "Subís el boceto", "Entregás el final y se libera el original"]
+    value: "FINAL_PREVIEW",
+    label: "aprobar la vista previa final",
+    help: "Terminás la obra, el comprador la ve con marca de agua y paga el segundo 50% para descargar el original."
   }
 ];
+
+const DEFAULT_MILESTONES = [
+  { title: "Boceto", description: "Pose y composición.", percent: 30, days: 3 },
+  { title: "Lineart", description: "Línea limpia.", percent: 30, days: 4 },
+  { title: "Color y entrega final", description: "Render terminado y archivo en alta.", percent: 40, days: 7 }
+];
+const MIN_MILESTONES = 2;
+const MAX_MILESTONES = 8;
 
 const ADDON_SUGGESTIONS = [
   { name: "Personaje adicional", pct: 0.7 },
@@ -105,7 +113,32 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
   const [addons, setAddons] = useState<AddonRow[]>(
     (initial?.addons ?? []).map((a) => ({ key: newKey(), id: a.id, name: a.name, price: String(a.priceArs) }))
   );
-  const [paymentPlan, setPaymentPlan] = useState<PaymentPlan>(initial?.paymentPlan ?? "SPLIT_ON_SKETCH");
+  const [planKind, setPlanKind] = useState<PlanKind>(
+    initial?.paymentPlan === "FULL_100" ? "FULL" : initial?.paymentPlan === "MILESTONES" ? "MILESTONES" : "SPLIT"
+  );
+  const [splitTrigger, setSplitTrigger] = useState<SplitTrigger>(
+    initial?.paymentPlan === "SPLIT_ON_FINAL_PREVIEW" ? "FINAL_PREVIEW" : "SKETCH"
+  );
+  const [milestones, setMilestones] = useState<MilestoneRow[]>(
+    (initial?.milestones?.length ? initial.milestones : DEFAULT_MILESTONES).map((m) => ({
+      key: newKey(),
+      title: m.title,
+      description: m.description,
+      percent: String(m.percent),
+      days: String(m.days)
+    }))
+  );
+  const paymentPlan: PaymentPlan =
+    planKind === "FULL"
+      ? "FULL_100"
+      : planKind === "MILESTONES"
+      ? "MILESTONES"
+      : splitTrigger === "SKETCH"
+      ? "SPLIT_ON_SKETCH"
+      : "SPLIT_ON_FINAL_PREVIEW";
+  const usesMilestones = planKind === "MILESTONES";
+  const milestonePercentSum = milestones.reduce((acc, m) => acc + (Number(m.percent) || 0), 0);
+  const milestoneDaysSum = milestones.reduce((acc, m) => acc + (Number(m.days) || 0), 0);
   const [publishNow, setPublishNow] = useState(initial?.isActive ?? true);
   const [showErrors, setShowErrors] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -122,7 +155,23 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
     if (price < 100) e[1].priceArs = "El precio mínimo es $100.";
     if (priceUsd && !(Number(priceUsd) >= 0)) e[1].priceUsd = "Precio en USD inválido.";
     const days = Number(turnaroundDays);
-    if (!Number.isInteger(days) || days < 1 || days > 365) e[1].turnaroundDays = "Entre 1 y 365 días.";
+    if (!usesMilestones && (!Number.isInteger(days) || days < 1 || days > 365)) e[1].turnaroundDays = "Entre 1 y 365 días.";
+    if (usesMilestones) {
+      milestones.forEach((m) => {
+        const pct = Number(m.percent);
+        const d = Number(m.days);
+        if (m.title.trim().length < 2) e[3][m.key] = "Ponele un nombre a la etapa.";
+        else if (!Number.isInteger(pct) || pct < 1 || pct > 99) e[3][m.key] = "El porcentaje va de 1 a 99.";
+        else if (!Number.isInteger(d) || d < 1 || d > 365) e[3][m.key] = "El plazo va de 1 a 365 días.";
+      });
+      if (milestones.length < MIN_MILESTONES) e[3].count = `Necesitás al menos ${MIN_MILESTONES} etapas.`;
+      else if (milestonePercentSum !== 100) {
+        e[3].sum =
+          milestonePercentSum < 100
+            ? `Las etapas suman ${milestonePercentSum}%: falta repartir ${100 - milestonePercentSum}%.`
+            : `Las etapas suman ${milestonePercentSum}%: sobra ${milestonePercentSum - 100}%.`;
+      }
+    }
     const names = new Set<string>();
     addons.forEach((a) => {
       const name = a.name.trim().toLowerCase();
@@ -132,7 +181,7 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
       names.add(name);
     });
     return e;
-  }, [title, description, price, priceUsd, turnaroundDays, addons]);
+  }, [title, description, price, priceUsd, turnaroundDays, addons, usesMilestones, milestones, milestonePercentSum]);
 
   const stepHasErrors = (i: number) => Object.keys(errors[i]).length > 0;
   const firstInvalidStep = errors.findIndex((e) => Object.keys(e).length > 0);
@@ -172,6 +221,37 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
     setAddons((prev) => prev.map((a) => (a.key === key ? { ...a, ...patch } : a)));
   }
 
+  function updateMilestone(key: string, patch: Partial<MilestoneRow>) {
+    setMilestones((prev) => prev.map((m) => (m.key === key ? { ...m, ...patch } : m)));
+  }
+
+  function addMilestone() {
+    if (milestones.length >= MAX_MILESTONES) return;
+    const remaining = Math.max(0, 100 - milestonePercentSum);
+    setMilestones((prev) => [
+      ...prev,
+      { key: newKey(), title: "", description: "", percent: remaining ? String(Math.min(99, remaining)) : "", days: "5" }
+    ]);
+  }
+
+  function moveMilestone(index: number, delta: number) {
+    setMilestones((prev) => {
+      const target = index + delta;
+      if (target < 0 || target >= prev.length) return prev;
+      const next = [...prev];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  }
+
+  /** Reparte el 100% en partes iguales; la última etapa absorbe el resto */
+  function splitMilestonesEvenly() {
+    setMilestones((prev) => {
+      const share = Math.floor(100 / prev.length);
+      return prev.map((m, i) => ({ ...m, percent: String(i === prev.length - 1 ? 100 - share * (prev.length - 1) : share) }));
+    });
+  }
+
   async function handleSave() {
     if (firstInvalidStep !== -1) {
       setShowErrors(true);
@@ -186,7 +266,15 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
       priceArs: price,
       priceUsd: priceUsd ? Number(priceUsd) : null,
       paymentPlan,
-      turnaroundDays: Number(turnaroundDays),
+      turnaroundDays: usesMilestones ? Math.min(365, milestoneDaysSum) : Number(turnaroundDays),
+      milestones: usesMilestones
+        ? milestones.map((m) => ({
+            title: m.title.trim(),
+            description: m.description.trim(),
+            percent: Number(m.percent),
+            days: Number(m.days)
+          }))
+        : [],
       maxSlots,
       revisionsIncluded,
       rating,
@@ -219,8 +307,14 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
   }
 
   const addonsTotal = addons.reduce((acc, a) => acc + (Number(a.price) || 0), 0);
-  const isSplit = paymentPlan !== "FULL_100";
-  const deposit = isSplit ? Math.round(price / 2) : price;
+  const deposit = Math.round(price / 2);
+  const shownDays = usesMilestones ? milestoneDaysSum : Number(turnaroundDays) || 0;
+  const planText =
+    planKind === "FULL"
+      ? "100% por adelantado"
+      : planKind === "MILESTONES"
+      ? `Por etapas: ${milestones.map((m) => `${m.title.trim() || "(sin nombre)"} ${m.percent || 0}%`).join(" · ")}`
+      : `50% de seña + 50% al ${SPLIT_TRIGGERS.find((t) => t.value === splitTrigger)!.label}`;
   const err = (i: number, field: string) => (showErrors ? errors[i][field] : undefined);
   const inputClass = (bad?: string) =>
     `w-full rounded-xl border px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/30 ${
@@ -457,7 +551,13 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
                 </div>
               </div>
 
-              <div>
+              {usesMilestones && (
+                <div className="rounded-2xl border border-purple-200 bg-purple-50/60 p-4 text-xs text-purple-900">
+                  <strong>Plazo de entrega: {milestoneDaysSum} días.</strong> Elegiste cobrar por etapas, así que el
+                  plazo total es la suma de los plazos de cada etapa (paso “Forma de cobro”).
+                </div>
+              )}
+              <div className={usesMilestones ? "hidden" : ""}>
                 <label htmlFor="svc-days" className="text-sm font-bold text-slate-900">
                   Plazo de entrega
                 </label>
@@ -611,52 +711,195 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
               <p className="text-xs text-slate-500">
                 El comprador acepta esta modalidad al pedir. Cada pago va directo a tu Mercado Pago.
               </p>
-              {PLAN_OPTIONS.map((o) => {
-                const selected = paymentPlan === o.value;
-                return (
-                  <label
-                    key={o.value}
-                    className={`block cursor-pointer rounded-2xl border p-4 transition ${
-                      selected ? "border-purple-600 bg-purple-50 ring-2 ring-purple-500/20" : "border-slate-200 hover:border-purple-300"
-                    }`}
+
+              {/* 50 / 50 con momento configurable */}
+              <PlanCard
+                selected={planKind === "SPLIT"}
+                onSelect={() => setPlanKind("SPLIT")}
+                title="50% de seña + 50% después"
+                badge="Recomendado"
+                summary="Cobrás la mitad al aceptar el pedido y elegís cuándo cobrar la otra mitad."
+              >
+                <div className="flex flex-wrap items-center gap-2 text-sm text-slate-800">
+                  <label htmlFor="split-trigger">50% de seña + 50% al</label>
+                  <select
+                    id="split-trigger"
+                    value={splitTrigger}
+                    onChange={(e) => setSplitTrigger(e.target.value as SplitTrigger)}
+                    className="rounded-xl border border-purple-300 bg-white px-3 py-2 text-sm font-bold text-purple-900 focus:outline-none focus:ring-2 focus:ring-purple-500/30"
                   >
-                    <input
-                      type="radio"
-                      name="paymentPlan"
-                      value={o.value}
-                      checked={selected}
-                      onChange={() => setPaymentPlan(o.value)}
-                      className="sr-only"
-                    />
-                    <span className="flex flex-wrap items-center gap-2">
-                      <span className={`flex h-4 w-4 items-center justify-center rounded-full border ${selected ? "border-purple-600" : "border-slate-300"}`}>
-                        {selected && <span className="h-2 w-2 rounded-full bg-purple-600" />}
-                      </span>
-                      <span className="text-sm font-bold text-slate-900">{o.title}</span>
-                      {o.badge && (
-                        <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-bold text-emerald-800">{o.badge}</span>
-                      )}
-                    </span>
-                    <ol className="mt-2.5 flex flex-wrap gap-x-2 gap-y-1 pl-6 text-xs text-slate-600">
-                      {o.steps.map((s, i) => (
-                        <li key={s} className="flex items-center gap-2">
-                          {i > 0 && <span className="text-slate-300">→</span>}
-                          {s}
-                        </li>
-                      ))}
-                    </ol>
-                    {selected && price > 0 && (
-                      <p className="mt-2.5 pl-6 text-xs font-semibold text-purple-800">
-                        Con el precio base:{" "}
-                        {o.value === "FULL_100"
-                          ? `un pago de ${money(price)}`
-                          : `${money(deposit)} de seña + ${money(price - deposit)} después`}
-                        .
-                      </p>
-                    )}
-                  </label>
-                );
-              })}
+                    {SPLIT_TRIGGERS.map((t) => (
+                      <option key={t.value} value={t.value}>
+                        {t.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <p className="mt-2 text-xs text-slate-600">{SPLIT_TRIGGERS.find((t) => t.value === splitTrigger)!.help}</p>
+                {price > 0 && (
+                  <p className="mt-2 text-xs font-semibold text-purple-800">
+                    Con el precio base: {money(deposit)} de seña + {money(price - deposit)} después.
+                  </p>
+                )}
+              </PlanCard>
+
+              {/* Por etapas */}
+              <PlanCard
+                selected={planKind === "MILESTONES"}
+                onSelect={() => setPlanKind("MILESTONES")}
+                title="Por etapas (milestones)"
+                summary="Dividís el trabajo en etapas con su propio pago y plazo. El comprador paga cada etapa antes de que la empieces y la aprueba al recibirla."
+              >
+                <ol className="space-y-3">
+                  {milestones.map((m, i) => {
+                    const bad = err(3, m.key);
+                    const pct = Number(m.percent) || 0;
+                    const isLast = i === milestones.length - 1;
+                    return (
+                      <li key={m.key} className={`rounded-2xl border bg-white p-3 ${bad ? "border-rose-300" : "border-slate-200"}`}>
+                        <div className="flex items-center gap-2">
+                          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-purple-600 text-[11px] font-bold text-white">
+                            {i + 1}
+                          </span>
+                          <input
+                            type="text"
+                            maxLength={80}
+                            aria-label={`Nombre de la etapa ${i + 1}`}
+                            value={m.title}
+                            onChange={(e) => updateMilestone(m.key, { title: e.target.value })}
+                            placeholder={isLast ? "Ej: Entrega final" : "Ej: Boceto"}
+                            className="min-w-0 flex-1 rounded-xl border border-slate-300 px-3 py-2 text-sm font-semibold focus:border-purple-600 focus:outline-none"
+                          />
+                          <div className="flex shrink-0 items-center">
+                            <button
+                              type="button"
+                              aria-label={`Subir etapa ${i + 1}`}
+                              disabled={i === 0}
+                              onClick={() => moveMilestone(i, -1)}
+                              className="rounded-lg px-1.5 py-1 text-slate-500 hover:bg-slate-100 disabled:opacity-25"
+                            >
+                              ↑
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={`Bajar etapa ${i + 1}`}
+                              disabled={isLast}
+                              onClick={() => moveMilestone(i, 1)}
+                              className="rounded-lg px-1.5 py-1 text-slate-500 hover:bg-slate-100 disabled:opacity-25"
+                            >
+                              ↓
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={`Quitar etapa ${m.title || i + 1}`}
+                              disabled={milestones.length <= MIN_MILESTONES}
+                              onClick={() => setMilestones((prev) => prev.filter((x) => x.key !== m.key))}
+                              className="rounded-lg px-1.5 py-1 text-slate-500 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-25"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+                        <input
+                          type="text"
+                          maxLength={500}
+                          aria-label={`Qué entregás en la etapa ${i + 1}`}
+                          value={m.description}
+                          onChange={(e) => updateMilestone(m.key, { description: e.target.value })}
+                          placeholder="Qué entregás en esta etapa (opcional)"
+                          className="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2 text-xs focus:border-purple-600 focus:outline-none"
+                        />
+                        <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-600">
+                          <label className="flex items-center gap-1.5">
+                            Pago
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              aria-label={`Porcentaje de la etapa ${i + 1}`}
+                              value={m.percent}
+                              onChange={(e) => updateMilestone(m.key, { percent: digits(e.target.value).slice(0, 2) })}
+                              className="w-14 rounded-lg border border-slate-300 px-2 py-1.5 text-center text-sm font-bold text-slate-900 focus:border-purple-600 focus:outline-none"
+                            />
+                            %
+                          </label>
+                          <label className="flex items-center gap-1.5">
+                            Plazo
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              aria-label={`Días de la etapa ${i + 1}`}
+                              value={m.days}
+                              onChange={(e) => updateMilestone(m.key, { days: digits(e.target.value).slice(0, 3) })}
+                              className="w-14 rounded-lg border border-slate-300 px-2 py-1.5 text-center text-sm font-bold text-slate-900 focus:border-purple-600 focus:outline-none"
+                            />
+                            días
+                          </label>
+                          {price > 0 && pct > 0 && (
+                            <span className="font-semibold text-purple-800">≈ {money((price * pct) / 100)} del precio base</span>
+                          )}
+                          {isLast && <span className="text-slate-400">Acá subís el archivo final.</span>}
+                        </div>
+                        {bad && <p className="mt-1.5 text-xs font-semibold text-rose-600">{bad}</p>}
+                      </li>
+                    );
+                  })}
+                </ol>
+
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={addMilestone}
+                    disabled={milestones.length >= MAX_MILESTONES}
+                    className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-bold text-white hover:bg-slate-800 disabled:opacity-40"
+                  >
+                    + Agregar etapa
+                  </button>
+                  <button
+                    type="button"
+                    onClick={splitMilestonesEvenly}
+                    className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                  >
+                    Repartir en partes iguales
+                  </button>
+                  <span className="text-xs text-slate-400">
+                    {milestones.length}/{MAX_MILESTONES}
+                  </span>
+                </div>
+
+                {/* Barra del 100% */}
+                <div className="mt-4">
+                  <div className="flex h-2.5 overflow-hidden rounded-full bg-slate-200" aria-hidden>
+                    {milestones.map((m, i) => (
+                      <div
+                        key={m.key}
+                        style={{ width: `${Math.min(100, Number(m.percent) || 0)}%` }}
+                        className={`${i % 2 === 0 ? "bg-purple-600" : "bg-purple-400"} ${milestonePercentSum > 100 ? "bg-rose-500" : ""}`}
+                      />
+                    ))}
+                  </div>
+                  <p
+                    role="status"
+                    className={`mt-1.5 text-xs font-semibold ${milestonePercentSum === 100 ? "text-emerald-700" : "text-rose-600"}`}
+                  >
+                    {milestonePercentSum === 100
+                      ? `Las etapas suman 100% · Plazo total: ${milestoneDaysSum} días`
+                      : milestonePercentSum < 100
+                      ? `Suman ${milestonePercentSum}%: falta repartir ${100 - milestonePercentSum}%`
+                      : `Suman ${milestonePercentSum}%: sobra ${milestonePercentSum - 100}%`}
+                  </p>
+                  {err(3, "count") && <p className="mt-1 text-xs font-semibold text-rose-600">{err(3, "count")}</p>}
+                </div>
+              </PlanCard>
+
+              {/* 100% */}
+              <PlanCard
+                selected={planKind === "FULL"}
+                onSelect={() => setPlanKind("FULL")}
+                title="100% por adelantado"
+                summary="Un solo pago al aceptar el pedido. Después subís el boceto y la entrega final."
+              >
+                {price > 0 && <p className="text-xs font-semibold text-purple-800">Un pago de {money(price)}.</p>}
+              </PlanCard>
             </fieldset>
           )}
 
@@ -671,7 +914,7 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
                   {tags.length > 0 && ` · ${tags.map((t) => `#${t}`).join(" ")}`}
                 </ReviewRow>
                 <ReviewRow label="Precio y entrega" onEdit={() => goTo(1)}>
-                  {money(price)} ARS · {turnaroundDays} días · {revisionsIncluded} revisiones · {maxSlots} cupos
+                  {money(price)} ARS · {shownDays} días · {revisionsIncluded} revisiones · {maxSlots} cupos
                 </ReviewRow>
                 <ReviewRow label="Extras" onEdit={() => goTo(2)}>
                   {addons.length === 0
@@ -679,7 +922,7 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
                     : addons.map((a) => `${a.name || "(sin nombre)"} +${money(Number(a.price) || 0)}`).join(" · ")}
                 </ReviewRow>
                 <ReviewRow label="Forma de cobro" onEdit={() => goTo(3)}>
-                  {PLAN_OPTIONS.find((o) => o.value === paymentPlan)?.title}
+                  {planText}
                 </ReviewRow>
               </dl>
 
@@ -750,14 +993,14 @@ export function ServiceEditor({ initial }: { initial?: ServiceDraft }) {
             </p>
             <div className="mt-3 space-y-1 rounded-xl bg-slate-50 p-3 text-xs">
               <p className="font-bold text-purple-800">
-                {paymentPlan === "FULL_100"
+                {planKind === "FULL"
                   ? "💳 100% al aceptar"
-                  : paymentPlan === "SPLIT_ON_SKETCH"
-                  ? "✨ 50% seña + 50% al aprobar boceto"
-                  : "🛡️ 50% seña + 50% en vista previa final"}
+                  : planKind === "MILESTONES"
+                  ? `🧩 Pago en ${milestones.length} etapas`
+                  : `✨ 50% seña + 50% al ${SPLIT_TRIGGERS.find((t) => t.value === splitTrigger)!.label}`}
               </p>
               <p className="text-slate-700">
-                ⏱️ {turnaroundDays || "?"} días · {revisionsIncluded} rev. · 🎟️ {maxSlots} cupos
+                ⏱️ {shownDays || "?"} días · {revisionsIncluded} rev. · 🎟️ {maxSlots} cupos
               </p>
             </div>
             {tags.length > 0 && (
@@ -837,6 +1080,45 @@ function ReviewRow({ label, onEdit, children }: { label: string; onEdit: () => v
       <button type="button" onClick={onEdit} className="shrink-0 text-xs font-bold text-purple-700 hover:underline">
         Editar
       </button>
+    </div>
+  );
+}
+
+function PlanCard(props: {
+  selected: boolean;
+  onSelect: () => void;
+  title: string;
+  summary: string;
+  badge?: string;
+  children?: React.ReactNode;
+}) {
+  const { selected, onSelect, title, summary, badge, children } = props;
+  return (
+    <div
+      className={`rounded-2xl border transition ${
+        selected ? "border-purple-600 bg-purple-50/60 ring-2 ring-purple-500/20" : "border-slate-200 hover:border-purple-300"
+      }`}
+    >
+      <label className="flex cursor-pointer items-start gap-3 p-4">
+        <input type="radio" name="planKind" checked={selected} onChange={onSelect} className="sr-only" />
+        <span
+          className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border ${
+            selected ? "border-purple-600" : "border-slate-300"
+          }`}
+        >
+          {selected && <span className="h-2 w-2 rounded-full bg-purple-600" />}
+        </span>
+        <span>
+          <span className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-bold text-slate-900">{title}</span>
+            {badge && (
+              <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-bold text-emerald-800">{badge}</span>
+            )}
+          </span>
+          <span className="mt-0.5 block text-xs text-slate-600">{summary}</span>
+        </span>
+      </label>
+      {selected && children && <div className="border-t border-purple-200/70 p-4">{children}</div>}
     </div>
   );
 }

@@ -23,6 +23,14 @@ La especificación de referencia es [`docs/business-planning/plan_tecnico_mvp.md
 
 `REQUESTED → (REJECTED) | ACCEPTED_WAITING_DEPOSIT → (EXPIRED a las 72 hs) | IN_PROGRESS_SKETCH ⇄ SKETCH_REVIEW → [WAITING_PAYMENT_AFTER_SKETCH] → WORKING_FINAL → [FINAL_PREVIEW_REVIEW → WAITING_PAYMENT_BEFORE_HD] → COMPLETED_HD_UNLOCKED`
 
+### Formas de cobro que elige el artista por comisión
+
+| Plan | Cómo se cobra |
+|---|---|
+| `FULL_100` | 100% al aceptar el pedido. |
+| `SPLIT_ON_SKETCH` / `SPLIT_ON_FINAL_PREVIEW` | 50% de seña + 50% al aprobar el boceto **o** la vista previa final. En el editor es una sola opción con el momento del segundo pago configurable. |
+| `MILESTONES` | Pago por etapas: el artista define de 2 a 8 etapas (nombre, descripción, % y plazo; los % suman 100). Cada etapa se paga antes de empezarla y se aprueba al recibirla: `ACCEPTED_WAITING_DEPOSIT → MILESTONE_IN_PROGRESS → MILESTONE_REVIEW → MILESTONE_WAITING_PAYMENT → …`. La última etapa es la entrega final; al aprobarla se desbloquea el original. |
+
 - Los montos, extras y fees se calculan **solo en el servidor**; el pedido guarda un *snapshot* inmutable de ToS, plan de pago, servicio y extras.
 - El original HD vive en el bucket privado y **solo se entrega con una URL firmada de 5 minutos cuando el 100% figura `APPROVED`**.
 - Los pagos se confirman por webhook (firma `x-signature` verificada) o al volver del checkout, consultando siempre la API de Mercado Pago. El procesamiento es idempotente.

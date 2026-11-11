@@ -3,7 +3,7 @@
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { apiFetch, uploadReference } from "@/lib/api";
+import { apiFetch, milestoneAmounts, uploadReference, type Milestone } from "@/lib/api";
 import { useMe } from "@/lib/useMe";
 
 type Addon = { id: string; name: string; priceArs: number };
@@ -68,7 +68,10 @@ export default function CommissionRequestPage() {
     .filter((a) => selectedAddons.includes(a.id))
     .reduce((sum, a) => sum + a.priceArs, 0);
   const totalArs = service.priceArs + extraAmountArs;
-  const isSplit = service.paymentPlan !== "FULL_100";
+  const isMilestones = service.paymentPlan === "MILESTONES";
+  const stages: Milestone[] = isMilestones ? service.milestones || [] : [];
+  const stageAmounts = milestoneAmounts(stages, totalArs);
+  const isSplit = service.paymentPlan === "SPLIT_ON_SKETCH" || service.paymentPlan === "SPLIT_ON_FINAL_PREVIEW";
   const depositArs = isSplit ? Math.round(totalArs / 2) : totalArs;
   const finalArs = isSplit ? totalArs - depositArs : 0;
   const secondPaymentMoment =
@@ -177,6 +180,8 @@ export default function CommissionRequestPage() {
             Modalidad:{" "}
             {service.paymentPlan === "FULL_100"
               ? "100% al inicio"
+              : isMilestones
+              ? `pago en ${stages.length} etapas (cada una se abona antes de que el artista la empiece)`
               : `50% de seña al aceptar el pedido y 50% al ${secondPaymentMoment}`}
           </p>
         </div>
@@ -326,7 +331,27 @@ export default function CommissionRequestPage() {
           {/* 5. Términos + checkbox legal */}
           <div className="rounded-2xl border border-purple-200 bg-purple-50/60 p-5">
             <h3 className="text-sm font-extrabold text-purple-950">Plan de pagos</h3>
-            <div className="mt-2 space-y-1.5 text-xs text-slate-700">
+            {isMilestones && (
+              <ol className="mt-2 space-y-2 text-xs text-slate-700">
+                {stages.map((m, i) => (
+                  <li key={i} className="flex items-start justify-between gap-3 rounded-xl bg-white p-2.5">
+                    <span>
+                      <strong className="text-slate-900">
+                        Etapa {i + 1}: {m.title}
+                      </strong>
+                      {m.description && <span className="block text-slate-500">{m.description}</span>}
+                      <span className="block text-slate-400">
+                        {i === 0 ? "Se paga al aceptar el artista tu solicitud" : `Se paga al aprobar la etapa ${i}`} · {m.days} días
+                      </span>
+                    </span>
+                    <strong className="shrink-0 text-slate-900">
+                      ${stageAmounts[i].toLocaleString("es-AR")} ARS ({m.percent}%)
+                    </strong>
+                  </li>
+                ))}
+              </ol>
+            )}
+            <div className={`mt-2 space-y-1.5 text-xs text-slate-700 ${isMilestones ? "hidden" : ""}`}>
               <div className="flex justify-between">
                 <span>1° pago (al aceptar el artista tu solicitud):</span>
                 <strong>
@@ -362,11 +387,16 @@ export default function CommissionRequestPage() {
                 Entiendo y acepto los Términos de Servicio de <strong>@{artist.username}</strong> y la modalidad de pago
                 elegida (
                 <strong>
-                  {isSplit
+                  {isMilestones
+                    ? `pago en ${stages.length} etapas, cada una antes de que el artista la empiece`
+                    : isSplit
                     ? `50% de seña al aceptar el pedido y 50% al ${secondPaymentMoment}`
                     : "100% al aceptar el pedido"}
                 </strong>
-                ). Entiendo que la seña inicial no es reembolsable una vez entregado el boceto.
+                ).{" "}
+                {isMilestones
+                  ? "Entiendo que el pago de cada etapa no es reembolsable una vez entregada esa etapa."
+                  : "Entiendo que la seña inicial no es reembolsable una vez entregado el boceto."}
               </span>
             </label>
           </div>

@@ -21,7 +21,17 @@ import { LIMITS, LIMITS_MB } from "../lib/limits.js";
 
 const ratingEnum = z.enum(["SFW", "SUGGESTIVE", "NSFW"]);
 const watermarkEnum = z.enum(["MANUAL", "AUTO_TEXT", "AUTO_AVATAR"]);
-const planEnum = z.enum(["FULL_100", "SPLIT_ON_SKETCH", "SPLIT_ON_FINAL_PREVIEW"]);
+const planEnum = z.enum(["FULL_100", "SPLIT_ON_SKETCH", "SPLIT_ON_FINAL_PREVIEW", "MILESTONES"]);
+
+export const MIN_MILESTONES = 2;
+export const MAX_MILESTONES = 8;
+
+const milestoneSchema = z.object({
+  title: z.string().trim().min(2, "Cada etapa necesita un nombre").max(80),
+  description: z.string().trim().max(500).default(""),
+  percent: z.number().int().min(1).max(99),
+  days: z.number().int().min(1).max(365)
+});
 
 const httpsUrl = z
   .string()
@@ -55,8 +65,31 @@ const serviceSchema = z.object({
     .refine(
       (list) => new Set(list.map((a) => a.name.toLowerCase())).size === list.length,
       "Hay extras con el mismo nombre"
-    )
+    ),
+  /** Solo para paymentPlan = MILESTONES: etapas de pago definidas por el artista */
+  milestones: z.array(milestoneSchema).max(MAX_MILESTONES).default([])
+}).superRefine((data, ctx) => {
+  if (data.paymentPlan !== "MILESTONES") return;
+  if (data.milestones.length < MIN_MILESTONES) {
+    ctx.addIssue({ code: "custom", path: ["milestones"], message: `El pago por etapas necesita al menos ${MIN_MILESTONES} etapas` });
+    return;
+  }
+  const sum = data.milestones.reduce((acc, m) => acc + m.percent, 0);
+  if (sum !== 100) {
+    ctx.addIssue({ code: "custom", path: ["milestones"], message: `Los porcentajes de las etapas deben sumar 100% (hoy suman ${sum}%)` });
+  }
 });
+
+/** Campos del servicio derivados del plan: las etapas solo se guardan con MILESTONES */
+function planFields(body: z.infer<typeof serviceSchema>) {
+  if (body.paymentPlan !== "MILESTONES") return { paymentPlan: body.paymentPlan, milestones: [], turnaroundDays: body.turnaroundDays };
+  return {
+    paymentPlan: body.paymentPlan,
+    milestones: body.milestones,
+    // El plazo total es la suma de los plazos de cada etapa
+    turnaroundDays: Math.min(365, body.milestones.reduce((acc, m) => acc + m.days, 0))
+  };
+}
 
 /** Oculta la imagen de items +18 a quien no activó el filtro */
 function visibleImage<T extends { rating: string; imageUrl: string }>(item: T, showNsfw: boolean) {
@@ -444,8 +477,7 @@ export async function artistRoutes(fastify: FastifyInstance) {
           description: body.description,
           priceArs: body.priceArs,
           priceUsd: body.priceUsd != null ? body.priceUsd.toFixed(2) : null,
-          paymentPlan: body.paymentPlan,
-          turnaroundDays: body.turnaroundDays,
+          ...planFields(body),
           maxSlots: body.maxSlots,
           revisionsIncluded: body.revisionsIncluded,
           rating: body.rating
@@ -474,8 +506,7 @@ export async function artistRoutes(fastify: FastifyInstance) {
           description: body.description,
           priceArs: body.priceArs,
           priceUsd: body.priceUsd != null ? body.priceUsd.toFixed(2) : null,
-          paymentPlan: body.paymentPlan,
-          turnaroundDays: body.turnaroundDays,
+          ...planFields(body),
           maxSlots: body.maxSlots,
           revisionsIncluded: body.revisionsIncluded,
           rating: body.rating

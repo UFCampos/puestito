@@ -5,6 +5,7 @@ import { useParams, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { apiFetch, API_URL, fileTooLarge, resolveImageUrl } from "../../../lib/api";
 import { useAppConfig } from "../../../lib/useAppConfig";
+import { MilestoneActions, MilestoneTimeline, type OrderMilestoneView } from "../../../components/MilestonePanel";
 
 const IMAGE_EXT = /\.(png|jpe?g|webp)$/i;
 const DELIVERY_EXT = /\.(png|jpe?g|webp|zip|rar|psd)$/i;
@@ -40,6 +41,9 @@ const STATUS_BADGE: Record<string, { text: string; color: string }> = {
   CANCELLED: { text: "Pedido Cancelado", color: "bg-rose-50 text-rose-700 border-rose-200" },
   REJECTED: { text: "Solicitud Rechazada (sin cobro)", color: "bg-rose-50 text-rose-700 border-rose-200" },
   EXPIRED: { text: "Vencido • No se pagó a tiempo", color: "bg-slate-100 text-slate-600 border-slate-200" },
+  MILESTONE_WAITING_PAYMENT: { text: "Etapa aprobada • Esperando el pago de la siguiente", color: "bg-pink-50 text-pink-700 border-pink-200" },
+  MILESTONE_IN_PROGRESS: { text: "Etapa paga • En proceso", color: "bg-blue-50 text-blue-700 border-blue-200" },
+  MILESTONE_REVIEW: { text: "Etapa entregada • Esperando aprobación", color: "bg-purple-50 text-purple-700 border-purple-200" },
 };
 
 export default function OrderWorkspacePageWrapper() {
@@ -398,6 +402,8 @@ function OrderWorkspacePage() {
   const badge = STATUS_BADGE[order.status] || { text: order.status, color: "bg-slate-100 text-slate-700" };
   const parsedRefs: string[] = order.referenceImages || [];
   const STATUS_STEPS = stepsFor(order.paymentPlanSnapshot);
+  const isMilestonePlan = order.paymentPlanSnapshot === "MILESTONES";
+  const orderMilestones: OrderMilestoneView[] = payload?.milestones || [];
   const currentStepIdx = STATUS_STEPS.findIndex((s) => s.key === order.status);
   const revisionsIncluded = order.serviceSnapshot?.revisionsIncluded ?? 0;
   const revisionsLeft = Math.max(0, revisionsIncluded - (order.revisionsUsed ?? 0));
@@ -459,14 +465,16 @@ function OrderWorkspacePage() {
           </p>
           <p className="mt-0.5 text-xs font-medium text-purple-600">
             {order.paymentPlanSnapshot === "FULL_100" && "Modalidad: 100% Anticipado"}
-            {order.paymentPlanSnapshot === "SPLIT_ON_SKETCH" && "Modalidad: 50% Seña + 50% al aprobar Boceto"}
-            {order.paymentPlanSnapshot === "SPLIT_ON_FINAL_PREVIEW" && "Modalidad: 50% Seña + 50% al aprobar Previa Final"}
+            {isMilestonePlan && `Modalidad: pago en ${orderMilestones.length} etapas`}
+            {order.paymentPlanSnapshot === "SPLIT_ON_SKETCH" && "Modalidad: 50% Seña + 50% al aprobar el boceto"}
+            {order.paymentPlanSnapshot === "SPLIT_ON_FINAL_PREVIEW" && "Modalidad: 50% Seña + 50% al aprobar la vista previa final"}
           </p>
         </div>
       </div>
 
       {/* Visual Stepper */}
-      <div className="mt-6 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
+      {isMilestonePlan && <MilestoneTimeline milestones={orderMilestones} />}
+      <div className={`mt-6 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8 ${isMilestonePlan ? "hidden" : ""}`}>
         {STATUS_STEPS.map((s, idx) => {
           const isCompleted = currentStepIdx >= 0 && (idx < currentStepIdx || order.status === "COMPLETED_HD_UNLOCKED");
           const isCurrent = order.status === s.key;
@@ -550,7 +558,9 @@ function OrderWorkspacePage() {
                 {isBuyer ? (
                   <div>
                     <p className="text-sm text-slate-700">
-                      ¡El artista aceptó tu comisión! Para comenzar a trabajar en el boceto, aboná el pago inicial mediante Mercado Pago Split.
+                      {isMilestonePlan
+                        ? `¡El artista aceptó tu comisión! Para que empiece la etapa 1 (“${orderMilestones[0]?.title ?? ""}”), aboná esa etapa con Mercado Pago.`
+                        : "¡El artista aceptó tu comisión! Para comenzar a trabajar en el boceto, aboná el pago inicial mediante Mercado Pago Split."}
                     </p>
                     <button
                       onClick={() => handleCheckout()}
@@ -902,6 +912,25 @@ function OrderWorkspacePage() {
               </p>
             )}
 
+            {/* Plan por etapas */}
+            {isMilestonePlan && order.status.startsWith("MILESTONE_") && (
+              <MilestoneActions
+                orderId={orderId}
+                status={order.status}
+                milestones={orderMilestones}
+                currentMilestone={order.currentMilestone ?? 0}
+                isArtist={isArtist}
+                isBuyer={isBuyer}
+                revisionsLeft={revisionsLeft}
+                revisionsIncluded={revisionsIncluded}
+                limits={limits}
+                busy={actionLoading}
+                setBusy={setActionLoading}
+                reload={loadOrder}
+                onCheckout={() => handleCheckout()}
+              />
+            )}
+
             {/* 9. COMPLETED_HD_UNLOCKED */}
             {order.status === "COMPLETED_HD_UNLOCKED" && (
               <div className="mt-3 space-y-4">
@@ -1105,6 +1134,8 @@ function OrderWorkspacePage() {
                         {m.stage === "DEPOSIT_50" && "1er 50% (Seña Inicial)"}
                         {m.stage === "FINAL_50" && "2do 50% (Saldo Final)"}
                         {m.stage === "FULL_100" && "Pago Único 100%"}
+                        {m.stage === "MILESTONE" &&
+                          `Etapa ${m.milestoneIndex + 1}: ${orderMilestones[m.milestoneIndex]?.title ?? ""}`}
                       </span>
                       <span>${Number(m.grossAmount).toLocaleString("es-AR")} ARS</span>
                     </div>

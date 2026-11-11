@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { apiFetch, API_URL, PLAN_LABEL, STATUS_LABEL, fileTooLarge, resolveImageUrl } from "../../lib/api";
+import { apiFetch, API_URL, STATUS_LABEL, fileTooLarge, planSummary, resolveImageUrl } from "../../lib/api";
 import { useAppConfig } from "../../lib/useAppConfig";
 
 const SERVICE_FEEDBACK: Record<string, string> = {
@@ -457,7 +457,7 @@ function ArtistDashboardPage() {
                     {srv.isActive ? "Publicada" : "Pausada"}
                   </span>
                   <span className="rounded-full bg-purple-50 px-2.5 py-0.5 text-[11px] font-bold text-purple-700">
-                    {PLAN_LABEL[srv.paymentPlan] ?? srv.paymentPlan}
+                    {planSummary(srv.paymentPlan, srv.milestones)}
                   </span>
                   <span className="text-[11px] font-semibold text-slate-400">{srv.rating}</span>
                 </div>
