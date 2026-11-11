@@ -6,7 +6,9 @@ import {
   orderMessages,
   orderMilestonePayments,
   paymentAccounts,
-  users
+  users,
+  type OrderMilestone,
+  type ServiceMilestone
 } from "../db/schema.js";
 import { config } from "../config.js";
 import { decryptSecret, encryptSecret } from "./crypto.service.js";
@@ -19,11 +21,28 @@ export type OrderStatus = Order["status"];
 export type PaymentPlan = Order["paymentPlanSnapshot"];
 export type MilestoneStage = (typeof orderMilestonePayments.$inferSelect)["stage"];
 
-export const PLAN_LABEL: Record<PaymentPlan, string> = {
+const PLAN_LABEL: Record<Exclude<PaymentPlan, "MILESTONES">, string> = {
   FULL_100: "100% al inicio",
   SPLIT_ON_SKETCH: "50% de seña al aceptar el pedido y 50% al aprobar el boceto",
   SPLIT_ON_FINAL_PREVIEW: "50% de seña al aceptar el pedido y 50% al aprobar la vista previa final con marca de agua"
 };
+
+/** Texto de la modalidad de pago que acepta el comprador (queda en el snapshot de términos) */
+export function planLabel(plan: PaymentPlan, milestones: Pick<ServiceMilestone, "title" | "percent">[] = []): string {
+  if (plan !== "MILESTONES") return PLAN_LABEL[plan];
+  const list = milestones.map((m, i) => `${i + 1}) ${m.title} — ${m.percent}%`).join("; ");
+  return `pago en ${milestones.length} etapas, cada una se abona antes de que el artista la empiece: ${list}`;
+}
+
+/** Convierte las etapas del servicio en montos en pesos; la última absorbe el redondeo */
+export function buildOrderMilestones(milestones: ServiceMilestone[], totalAmount: number): OrderMilestone[] {
+  let assigned = 0;
+  return milestones.map((m, i) => {
+    const amount = i === milestones.length - 1 ? totalAmount - assigned : Math.round((totalAmount * m.percent) / 100);
+    assigned += amount;
+    return { ...m, amount };
+  });
+}
 
 /** Estados en los que el pedido ya no admite acciones */
 export const TERMINAL_STATUSES: OrderStatus[] = ["REJECTED", "EXPIRED", "CANCELLED", "COMPLETED_HD_UNLOCKED"];
@@ -35,43 +54,93 @@ export const SLOT_STATUSES: OrderStatus[] = [
   "WAITING_PAYMENT_AFTER_SKETCH",
   "WORKING_FINAL",
   "FINAL_PREVIEW_REVIEW",
-  "WAITING_PAYMENT_BEFORE_HD"
+  "WAITING_PAYMENT_BEFORE_HD",
+  "MILESTONE_WAITING_PAYMENT",
+  "MILESTONE_IN_PROGRESS",
+  "MILESTONE_REVIEW"
 ];
 
 /** Cálculo de montos y fee (Plan Sprint 5: marketplace_fee 5%) */
-export function computeAmounts(plan: PaymentPlan, totalAmount: number) {
+export function computeAmounts(plan: PaymentPlan, totalAmount: number, milestones: OrderMilestone[] = []) {
   const platformFeeAmount = Math.round(totalAmount * config.PLATFORM_FEE_RATE);
   if (plan === "FULL_100") {
     return { platformFeeAmount, depositAmount: totalAmount, finalAmount: 0 };
+  }
+  if (plan === "MILESTONES") {
+    // El "depósito" es la primera etapa: es lo que hay que pagar dentro de las 72 hs
+    const first = milestones[0]?.amount ?? totalAmount;
+    return { platformFeeAmount, depositAmount: first, finalAmount: totalAmount - first };
   }
   const depositAmount = Math.round(totalAmount / 2);
   return { platformFeeAmount, depositAmount, finalAmount: totalAmount - depositAmount };
 }
 
-/** Fee de cada hito: el del segundo pago completa el total exacto pactado */
-export function milestoneFee(order: Order, stage: MilestoneStage): number {
-  if (stage === "FULL_100") return order.platformFeeAmount;
-  const depositFee = Math.round(order.depositAmount * config.PLATFORM_FEE_RATE);
-  return stage === "DEPOSIT_50" ? depositFee : order.platformFeeAmount - depositFee;
+/** Fee de una etapa (plan MILESTONES): la última completa el fee total exacto del pedido */
+export function milestoneStageFee(order: Pick<Order, "milestonesSnapshot" | "platformFeeAmount">, index: number): number {
+  const fees = order.milestonesSnapshot.map((m) => Math.round(m.amount * config.PLATFORM_FEE_RATE));
+  if (index < fees.length - 1) return fees[index] ?? 0;
+  return order.platformFeeAmount - fees.slice(0, -1).reduce((a, b) => a + b, 0);
 }
 
-/** Qué hito de pago corresponde al estado actual (o null si no hay pago pendiente) */
-export function expectedStage(order: Pick<Order, "status" | "paymentPlanSnapshot">): MilestoneStage | null {
+export interface PendingPayment {
+  stage: MilestoneStage;
+  /** Índice de etapa (0 salvo en stage = MILESTONE) */
+  milestoneIndex: number;
+  amount: number;
+  fee: number;
+  /** Parte neutra del concepto de cobro */
+  concept: string;
+}
+
+type PaymentContext = Pick<
+  Order,
+  | "status"
+  | "paymentPlanSnapshot"
+  | "milestonesSnapshot"
+  | "currentMilestone"
+  | "depositAmount"
+  | "finalAmount"
+  | "platformFeeAmount"
+>;
+
+/** Qué pago corresponde al estado actual del pedido (o null si no hay ninguno pendiente) */
+export function pendingPayment(order: PaymentContext): PendingPayment | null {
+  if (order.paymentPlanSnapshot === "MILESTONES") {
+    if (order.status !== "ACCEPTED_WAITING_DEPOSIT" && order.status !== "MILESTONE_WAITING_PAYMENT") return null;
+    const index = order.status === "ACCEPTED_WAITING_DEPOSIT" ? 0 : order.currentMilestone;
+    const milestone = order.milestonesSnapshot[index];
+    if (!milestone) return null;
+    return {
+      stage: "MILESTONE",
+      milestoneIndex: index,
+      amount: milestone.amount,
+      fee: milestoneStageFee(order, index),
+      concept: `etapa ${index + 1} de ${order.milestonesSnapshot.length}`
+    };
+  }
+  const depositFee = Math.round(order.depositAmount * config.PLATFORM_FEE_RATE);
   switch (order.status) {
     case "ACCEPTED_WAITING_DEPOSIT":
-      return order.paymentPlanSnapshot === "FULL_100" ? "FULL_100" : "DEPOSIT_50";
+      return order.paymentPlanSnapshot === "FULL_100"
+        ? { stage: "FULL_100", milestoneIndex: 0, amount: order.depositAmount, fee: order.platformFeeAmount, concept: "pago total" }
+        : { stage: "DEPOSIT_50", milestoneIndex: 0, amount: order.depositAmount, fee: depositFee, concept: "seña 50%" };
     case "WAITING_PAYMENT_AFTER_SKETCH":
     case "WAITING_PAYMENT_BEFORE_HD":
-      return "FINAL_50";
+      return {
+        stage: "FINAL_50",
+        milestoneIndex: 0,
+        amount: order.finalAmount,
+        fee: order.platformFeeAmount - depositFee,
+        concept: "saldo 50%"
+      };
     default:
       return null;
   }
 }
 
 /** Concepto neutro para Mercado Pago (Plan §2) */
-export function neutralTitle(orderNumber: string, artistUsername: string, stage: MilestoneStage) {
-  const part = stage === "FULL_100" ? "pago total" : stage === "DEPOSIT_50" ? "seña 50%" : "saldo 50%";
-  return `Encargo de ilustración digital #${orderNumber} — @${artistUsername} (${part})`;
+export function neutralTitle(orderNumber: string, artistUsername: string, concept: string) {
+  return `Encargo de ilustración digital #${orderNumber} — @${artistUsername} (${concept})`;
 }
 
 export async function addSystemMessage(tx: DbOrTx, orderId: string, content: string) {
@@ -182,6 +251,22 @@ export async function getArtistMpToken(artistId: string): Promise<{ token: strin
 // ─────────────────────────────────────────────────────────────
 // Procesamiento de pagos (webhook / retorno / simulador)
 // ─────────────────────────────────────────────────────────────
+function nextAfterPayment(order: Order): { to: OrderStatus; message: string } | undefined {
+  if (order.paymentPlanSnapshot === "MILESTONES") {
+    const index = order.status === "MILESTONE_WAITING_PAYMENT" ? order.currentMilestone : 0;
+    const title = order.milestonesSnapshot[index]?.title ?? "";
+    const base = `Etapa ${index + 1} de ${order.milestonesSnapshot.length} ("${title}") paga: el artista ya puede empezarla.`;
+    if (order.status === "ACCEPTED_WAITING_DEPOSIT" || order.status === "MILESTONE_WAITING_PAYMENT") {
+      return { to: "MILESTONE_IN_PROGRESS", message: base };
+    }
+    if (order.status === "EXPIRED") {
+      return { to: "MILESTONE_IN_PROGRESS", message: `${base} (El pago llegó después del vencimiento y el pedido se reactivó.)` };
+    }
+    return undefined;
+  }
+  return NEXT_AFTER_PAYMENT[order.status];
+}
+
 const NEXT_AFTER_PAYMENT: Record<string, { to: OrderStatus; message: string }> = {
   ACCEPTED_WAITING_DEPOSIT: {
     to: "IN_PROGRESS_SKETCH",
@@ -257,15 +342,23 @@ export async function applyMpPayment(payment: Pick<MpPayment, "id" | "status" | 
       .set({ status: "APPROVED", mpPaymentId, paidAt: new Date() })
       .where(eq(orderMilestonePayments.id, milestone.id));
 
-    const stageMatches = expectedStage({ ...order, status: order.status === "EXPIRED" ? "ACCEPTED_WAITING_DEPOSIT" : order.status }) === milestone.stage;
-    const next = NEXT_AFTER_PAYMENT[order.status];
+    const expected = pendingPayment({
+      ...order,
+      status: order.status === "EXPIRED" ? "ACCEPTED_WAITING_DEPOSIT" : order.status
+    });
+    const stageMatches = expected?.stage === milestone.stage && expected.milestoneIndex === milestone.milestoneIndex;
+    const next = nextAfterPayment(order);
     if (!stageMatches || !next) {
       await addSystemMessage(tx, order.id, `💳 Pago #${mpPaymentId} acreditado, pero el pedido está en estado ${order.status}. Soporte lo revisará.`);
       await notifyDiscord(`⚠️ Pago acreditado fuera de flujo en #${order.orderNumber}: estado ${order.status}, hito ${milestone.stage}`);
       return { outcome: "applied" as const, order, notify: null };
     }
 
-    const updated = await transition(tx, order.id, order.status, next.to, next.to === "COMPLETED_HD_UNLOCKED" ? { completedAt: new Date() } : {});
+    const updated = await transition(tx, order.id, order.status, next.to, {
+      ...(next.to === "COMPLETED_HD_UNLOCKED" ? { completedAt: new Date() } : {}),
+      // Un pedido por etapas reactivado tras vencer vuelve a la primera etapa
+      ...(order.paymentPlanSnapshot === "MILESTONES" && order.status !== "MILESTONE_WAITING_PAYMENT" ? { currentMilestone: 0 } : {})
+    });
     await addSystemMessage(tx, order.id, `💳 Pago #${mpPaymentId} APROBADO ($${milestone.grossAmount.toLocaleString("es-AR")} ARS). ${next.message}`);
     return { outcome: "applied" as const, order: updated, notify: next.message };
   });

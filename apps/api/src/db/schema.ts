@@ -23,7 +23,9 @@ export const watermarkModeEnum = pgEnum("watermark_mode", ["MANUAL", "AUTO_TEXT"
 export const paymentPlanEnum = pgEnum("payment_plan", [
   "FULL_100",
   "SPLIT_ON_SKETCH",
-  "SPLIT_ON_FINAL_PREVIEW"
+  "SPLIT_ON_FINAL_PREVIEW",
+  // Pago por etapas configurables por el artista (cada etapa se paga antes de empezarla)
+  "MILESTONES"
 ]);
 export const contentRatingEnum = pgEnum("content_rating", ["SFW", "SUGGESTIVE", "NSFW"]);
 export const orderStatusEnum = pgEnum("order_status", [
@@ -38,11 +40,15 @@ export const orderStatusEnum = pgEnum("order_status", [
   "FINAL_PREVIEW_REVIEW",
   "WAITING_PAYMENT_BEFORE_HD",
   "COMPLETED_HD_UNLOCKED",
-  "CANCELLED"
+  "CANCELLED",
+  // Plan MILESTONES: pago de la etapa → trabajo → revisión → siguiente etapa
+  "MILESTONE_WAITING_PAYMENT",
+  "MILESTONE_IN_PROGRESS",
+  "MILESTONE_REVIEW"
 ]);
 export const currencyEnum = pgEnum("currency", ["ARS", "USD"]);
 export const paymentProviderEnum = pgEnum("payment_provider", ["MERCADOPAGO", "ASTROPAY"]);
-export const milestoneStageEnum = pgEnum("milestone_stage", ["FULL_100", "DEPOSIT_50", "FINAL_50"]);
+export const milestoneStageEnum = pgEnum("milestone_stage", ["FULL_100", "DEPOSIT_50", "FINAL_50", "MILESTONE"]);
 export const milestoneStatusEnum = pgEnum("milestone_status", [
   "PENDING",
   "APPROVED",
@@ -54,7 +60,8 @@ export const messageTypeEnum = pgEnum("message_type", [
   "TEXT",
   "SKETCH_SUBMISSION",
   "FINAL_PREVIEW_SUBMISSION",
-  "SYSTEM_EVENT"
+  "SYSTEM_EVENT",
+  "MILESTONE_SUBMISSION"
 ]);
 
 const createdAt = () => timestamp("created_at", { withTimezone: true }).defaultNow().notNull();
@@ -229,6 +236,11 @@ export const portfolioItemTags = pgTable(
 // ─────────────────────────────────────────────────────────────
 // COMMISSION_SERVICE + COMMISSION_ADDON
 // ─────────────────────────────────────────────────────────────
+/** Etapa de pago definida por el artista (plan MILESTONES). Los porcentajes suman 100. */
+export type ServiceMilestone = { title: string; description: string; percent: number; days: number };
+/** Etapa congelada en el pedido, con su monto en pesos ya calculado */
+export type OrderMilestone = ServiceMilestone & { amount: number };
+
 export const commissionServices = pgTable(
   "commission_services",
   {
@@ -241,6 +253,7 @@ export const commissionServices = pgTable(
     priceArs: integer("price_ars").notNull(),
     priceUsd: numeric("price_usd", { precision: 10, scale: 2 }),
     paymentPlan: paymentPlanEnum("payment_plan").default("SPLIT_ON_SKETCH").notNull(),
+    milestones: jsonb("milestones").$type<ServiceMilestone[]>().default([]).notNull(),
     turnaroundDays: integer("turnaround_days").default(14).notNull(),
     maxSlots: integer("max_slots").default(3).notNull(),
     revisionsIncluded: integer("revisions_included").default(2).notNull(),
@@ -303,6 +316,9 @@ export const commissionOrders = pgTable(
       .references(() => commissionServices.id),
     status: orderStatusEnum("status").default("REQUESTED").notNull(),
     paymentPlanSnapshot: paymentPlanEnum("payment_plan_snapshot").notNull(),
+    milestonesSnapshot: jsonb("milestones_snapshot").$type<OrderMilestone[]>().default([]).notNull(),
+    /** Índice de la etapa en curso (plan MILESTONES) */
+    currentMilestone: integer("current_milestone").default(0).notNull(),
     termsSnapshot: text("terms_snapshot").notNull(),
     termsAcceptedAt: timestamp("terms_accepted_at", { withTimezone: true }).notNull(),
     serviceSnapshot: jsonb("service_snapshot")
@@ -351,6 +367,8 @@ export const orderMilestonePayments = pgTable(
       .notNull()
       .references(() => commissionOrders.id, { onDelete: "cascade" }),
     stage: milestoneStageEnum("stage").notNull(),
+    /** Solo para stage = MILESTONE: índice de la etapa que paga */
+    milestoneIndex: integer("milestone_index").default(0).notNull(),
     provider: paymentProviderEnum("provider").default("MERCADOPAGO").notNull(),
     grossAmount: integer("gross_amount").notNull(),
     marketplaceFee: integer("marketplace_fee").notNull(),
@@ -362,7 +380,7 @@ export const orderMilestonePayments = pgTable(
     createdAt: createdAt(),
     updatedAt: updatedAt()
   },
-  (t) => [uniqueIndex("order_milestone_payments_order_stage_uq").on(t.orderId, t.stage)]
+  (t) => [uniqueIndex("order_milestone_payments_order_stage_uq").on(t.orderId, t.stage, t.milestoneIndex)]
 );
 
 // ─────────────────────────────────────────────────────────────

@@ -74,11 +74,79 @@ export const STATUS_LABEL: Record<string, string> = {
   FINAL_PREVIEW_REVIEW: "Vista previa en revisión",
   WAITING_PAYMENT_BEFORE_HD: "Esperando pago final",
   COMPLETED_HD_UNLOCKED: "Completado",
-  CANCELLED: "Cancelado"
+  CANCELLED: "Cancelado",
+  MILESTONE_WAITING_PAYMENT: "Esperando pago de etapa",
+  MILESTONE_IN_PROGRESS: "Etapa en proceso",
+  MILESTONE_REVIEW: "Etapa en revisión"
 };
 
 export const PLAN_LABEL: Record<string, string> = {
   FULL_100: "100% al inicio",
   SPLIT_ON_SKETCH: "50% seña + 50% al aprobar el boceto",
-  SPLIT_ON_FINAL_PREVIEW: "50% seña + 50% al aprobar la vista previa final"
+  SPLIT_ON_FINAL_PREVIEW: "50% seña + 50% al aprobar la vista previa final",
+  MILESTONES: "Pago por etapas"
 };
+
+export interface Milestone {
+  title: string;
+  description: string;
+  percent: number;
+  days: number;
+  /** Solo en pedidos: monto en pesos ya calculado */
+  amount?: number;
+}
+
+/** Texto corto de la modalidad de cobro, p. ej. "Pago en 4 etapas" */
+export function planSummary(plan: string, milestones?: Milestone[] | null): string {
+  if (plan === "MILESTONES") return `Pago en ${milestones?.length ?? 0} etapas`;
+  return PLAN_LABEL[plan] ?? plan;
+}
+
+/** Reparte un total en las etapas igual que el servidor: la última absorbe el redondeo */
+export function milestoneAmounts(milestones: Milestone[], total: number): number[] {
+  let assigned = 0;
+  return milestones.map((m, i) => {
+    const amount = i === milestones.length - 1 ? total - assigned : Math.round((total * m.percent) / 100);
+    assigned += amount;
+    return amount;
+  });
+}
+
+export interface AppConfig {
+  uploadLimitsMb: {
+    reference: number;
+    avatar: number;
+    portfolio: number;
+    sketch: number;
+    finalPreview: number;
+    finalDelivery: number;
+  };
+  finalDeliveryFormats: string[];
+  platformFeePercent: number;
+  depositExpirationHours: number;
+}
+
+export const DEFAULT_APP_CONFIG: AppConfig = {
+  uploadLimitsMb: { reference: 5, avatar: 8, portfolio: 25, sketch: 30, finalPreview: 30, finalDelivery: 200 },
+  finalDeliveryFormats: ["png", "jpg", "webp", "zip", "rar", "psd"],
+  platformFeePercent: 5,
+  depositExpirationHours: 72
+};
+
+let configPromise: Promise<AppConfig> | null = null;
+
+/** Límites de subida y reglas de la plataforma (una sola consulta por sesión de navegación) */
+export function fetchAppConfig(): Promise<AppConfig> {
+  configPromise ??= apiFetch<AppConfig>("/api/config").catch(() => {
+    configPromise = null;
+    return DEFAULT_APP_CONFIG;
+  });
+  return configPromise;
+}
+
+/** Devuelve un mensaje de error si el archivo supera el límite, o null si está bien */
+export function fileTooLarge(file: File, maxMb: number): string | null {
+  if (file.size <= maxMb * 1024 * 1024) return null;
+  const sizeMb = (file.size / 1024 / 1024).toFixed(1);
+  return `"${file.name}" pesa ${sizeMb} MB y el máximo es ${maxMb} MB.`;
+}

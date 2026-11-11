@@ -2,6 +2,13 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { MultipartFile } from "@fastify/multipart";
 import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { z } from "zod";
+import sharp from "sharp";
+import crypto from "node:crypto";
+import { createWriteStream } from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { alias } from "drizzle-orm/pg-core";
 import { db } from "../db/index.js";
 import {
@@ -17,18 +24,19 @@ import {
 import { config } from "../config.js";
 import { HttpError, parseBody, requireUser, type SessionUser } from "../lib/http.js";
 import { MAX_REFERENCE_BYTES, extensionFor, newKey, storage } from "../services/storage.service.js";
+import { DELIVERY_FORMATS, LIMITS, LIMITS_MB, sniffArchive } from "../lib/limits.js";
 import { WatermarkService } from "../services/watermark.service.js";
 import { MercadoPagoService, MercadoPagoError } from "../services/mercadopago.service.js";
 import { notifyDiscord } from "../services/notification.service.js";
 import { loadAvatar } from "./artist.routes.js";
 import {
-  PLAN_LABEL,
   SLOT_STATUSES,
   addSystemMessage,
   computeAmounts,
-  expectedStage,
+  buildOrderMilestones,
+  pendingPayment,
+  planLabel,
   getArtistMpToken,
-  milestoneFee,
   neutralTitle,
   nextOrderNumber,
   notifyOrder,
@@ -36,7 +44,6 @@ import {
   type Order
 } from "../services/order.service.js";
 
-const MAX_DELIVERY_BYTES = 200 * 1024 * 1024;
 
 /** Carga el pedido y determina el rol del usuario; 404 si no participa (no revela existencia) */
 async function loadOrderFor(request: FastifyRequest, user: SessionUser) {
@@ -69,6 +76,112 @@ function multipartField(file: MultipartFile, name: string): string | undefined {
 
 async function signAll(keys: string[]): Promise<string[]> {
   return Promise.all(keys.map((k) => storage.signedGetUrl(k)));
+}
+
+/**
+ * Recibe la entrega final (multipart): original HD (imagen, .zip, .rar o .psd) + imagen de vista previa.
+ * Guarda el original en el bucket privado por streaming y genera la vista previa con marca de agua.
+ */
+async function receiveFinalDelivery(
+  request: FastifyRequest,
+  order: Order,
+  artistProfile: typeof artistProfiles.$inferSelect,
+  user: SessionUser
+): Promise<{ hdKey: string; previewKey: string; safeName: string }> {
+  const tmpPath = path.join(os.tmpdir(), `tp-final-${crypto.randomUUID()}`);
+  const previewKey = newKey(`orders/${order.id}/preview`, "webp");
+  let hd: { filename: string; size: number } | null = null;
+  let previewSource: Buffer | null = null;
+  let mode = artistProfile.defaultWatermarkMode;
+  let hdKey = "";
+  let hdExt = "";
+
+  try {
+    for await (const part of request.parts({ limits: { fileSize: LIMITS.finalDeliveryBytes, files: 2 } })) {
+      if (part.type === "file") {
+        if (part.fieldname === "file" && !hd) {
+          await pipeline(part.file, createWriteStream(tmpPath)).catch((err: { code?: string }) => {
+            if (err?.code === "FST_REQ_FILE_TOO_LARGE") {
+              throw new HttpError(413, `El archivo final supera los ${LIMITS_MB.finalDelivery} MB`);
+            }
+            throw err;
+          });
+          if (part.file.truncated) {
+            throw new HttpError(413, `El archivo final supera los ${LIMITS_MB.finalDelivery} MB`);
+          }
+          hd = { filename: part.filename || "entrega", size: (await fsp.stat(tmpPath)).size };
+        } else if (part.fieldname === "preview" && !previewSource) {
+          const chunks: Buffer[] = [];
+          let total = 0;
+          for await (const chunk of part.file) {
+            total += (chunk as Buffer).length;
+            if (total > LIMITS.finalPreviewBytes) {
+              throw new HttpError(413, `La imagen de vista previa supera los ${LIMITS_MB.finalPreview} MB`);
+            }
+            chunks.push(chunk as Buffer);
+          }
+          previewSource = Buffer.concat(chunks);
+        } else {
+          part.file.resume();
+        }
+      } else if (part.fieldname === "watermarkMode") {
+        mode = z.enum(["MANUAL", "AUTO_TEXT", "AUTO_AVATAR"]).catch(mode).parse(part.value);
+      }
+    }
+    if (!hd || hd.size === 0) throw new HttpError(400, "Subí el archivo final (imagen, .zip o .rar)");
+
+    // El formato se decide por el contenido real del archivo, no por su extensión
+    const handle = await fsp.open(tmpPath, "r");
+    const head = Buffer.alloc(16);
+    await handle.read(head, 0, 16, 0);
+    await handle.close();
+    const archive = sniffArchive(head);
+
+    let hdType: string;
+    if (archive) {
+      hdType = DELIVERY_FORMATS[archive].contentType;
+      hdExt = DELIVERY_FORMATS[archive].ext;
+    } else {
+      const meta = await sharp(tmpPath).metadata().catch(() => null);
+      const imageExt = ({ png: "png", jpeg: "jpg", webp: "webp" } as Record<string, string>)[meta?.format ?? ""];
+      if (!meta?.width || !imageExt) {
+        throw new HttpError(400, "Formato no admitido. Subí una imagen PNG, JPG o WebP, o un paquete .zip, .rar o .psd");
+      }
+      hdType = `image/${meta.format}`;
+      hdExt = imageExt;
+    }
+
+    const source: Buffer | string | null = previewSource ?? (archive ? null : tmpPath);
+    if (!source) {
+      throw new HttpError(400, "Si entregás un .zip, .rar o .psd, subí también una imagen para la vista previa");
+    }
+    await WatermarkService.assertImage(source).catch((e: Error) => {
+      throw new HttpError(400, e.message);
+    });
+
+    // Vista previa en baja resolución con marca de agua
+    const preview = await WatermarkService.apply(source, {
+      mode,
+      username: user.username,
+      customText: artistProfile.watermarkCustomText,
+      avatar: mode === "AUTO_AVATAR" ? await loadAvatar(user.image) : null,
+      maxWidth: 1000
+    });
+    hdKey = newKey(`orders/${order.id}/final`, hdExt);
+    await storage.putFile("private", hdKey, tmpPath, hd.size, hdType);
+    await storage.put("private", previewKey, preview, "image/webp");
+  } finally {
+    await fsp.rm(tmpPath, { force: true }).catch(() => {});
+  }
+
+  // El nombre de descarga lleva la extensión real detectada, no la que venía en el archivo
+  const baseName =
+    hd.filename
+      .replace(/\.[a-z0-9]{1,5}$/i, "")
+      .replace(/[^a-zA-Z0-9._-]/g, "_")
+      .slice(-70) || "entrega";
+  const safeName = `${order.orderNumber}-${baseName}.${hdExt}`;
+  return { hdKey, previewKey, safeName };
 }
 
 export async function orderRoutes(fastify: FastifyInstance) {
@@ -139,13 +252,21 @@ export async function orderRoutes(fastify: FastifyInstance) {
     }
 
     const totalAmount = service.priceArs + addons.reduce((acc, a) => acc + a.priceArs, 0);
-    const amounts = computeAmounts(service.paymentPlan, totalAmount);
+    if (service.paymentPlan === "MILESTONES" && service.milestones.length < 2) {
+      throw new HttpError(409, "Este servicio tiene el plan de etapas incompleto. Avisale al artista.");
+    }
+    const milestonesSnapshot =
+      service.paymentPlan === "MILESTONES" ? buildOrderMilestones(service.milestones, totalAmount) : [];
+    const amounts = computeAmounts(service.paymentPlan, totalAmount, milestonesSnapshot);
+    const agreedPlan = planLabel(service.paymentPlan, milestonesSnapshot);
     const termsSnapshot = [
       `Términos de Servicio de @${artistUser.username}:`,
       profile.termsOfService?.trim() || "(El artista no publicó términos propios; aplican los Términos de TuPuestito.)",
       "",
-      `Modalidad de pago aceptada: ${PLAN_LABEL[service.paymentPlan]}.`,
-      "El comprador entiende que la seña inicial no es reembolsable una vez entregado el boceto."
+      `Modalidad de pago aceptada: ${agreedPlan}.`,
+      service.paymentPlan === "MILESTONES"
+        ? "El comprador entiende que el pago de cada etapa no es reembolsable una vez entregada esa etapa."
+        : "El comprador entiende que la seña inicial no es reembolsable una vez entregado el boceto."
     ].join("\n");
 
     const order = await db.transaction(async (tx) => {
@@ -159,6 +280,7 @@ export async function orderRoutes(fastify: FastifyInstance) {
           serviceId: service.id,
           status: "REQUESTED",
           paymentPlanSnapshot: service.paymentPlan,
+          milestonesSnapshot,
           termsSnapshot,
           termsAcceptedAt: new Date(),
           serviceSnapshot: {
@@ -180,7 +302,7 @@ export async function orderRoutes(fastify: FastifyInstance) {
       await addSystemMessage(
         tx,
         created!.id,
-        `📝 Solicitud #${orderNumber} enviada con ${refs.length} referencia(s). Modalidad pactada: ${PLAN_LABEL[service.paymentPlan]}. Esperando que el artista acepte el pedido.`
+        `📝 Solicitud #${orderNumber} enviada con ${refs.length} referencia(s). Modalidad pactada: ${agreedPlan}. Esperando que el artista acepte el pedido.`
       );
       return created!;
     });
@@ -275,6 +397,7 @@ export async function orderRoutes(fastify: FastifyInstance) {
         .select({
           id: orderMilestonePayments.id,
           stage: orderMilestonePayments.stage,
+          milestoneIndex: orderMilestonePayments.milestoneIndex,
           grossAmount: orderMilestonePayments.grossAmount,
           marketplaceFee: orderMilestonePayments.marketplaceFee,
           status: orderMilestonePayments.status,
@@ -303,11 +426,31 @@ export async function orderRoutes(fastify: FastifyInstance) {
         hasFinalHd: Boolean(finalHdPrivateKey),
         hdUnlocked
       },
-      nextPaymentStage: expectedStage(order),
+      nextPayment: (() => {
+        const p = pendingPayment(order);
+        return p ? { stage: p.stage, milestoneIndex: p.milestoneIndex, amount: p.amount } : null;
+      })(),
       depositExpiresAt:
         order.status === "ACCEPTED_WAITING_DEPOSIT" && order.acceptedAt
           ? new Date(order.acceptedAt.getTime() + config.DEPOSIT_EXPIRATION_HOURS * 3600_000)
           : null,
+      // Plan por etapas: estado de cada una, derivado del pedido y de sus pagos
+      milestones: order.milestonesSnapshot.map((m, i) => {
+        const paid = payments.some((p) => p.stage === "MILESTONE" && p.milestoneIndex === i && p.status === "APPROVED");
+        const state =
+          order.status === "COMPLETED_HD_UNLOCKED" || i < order.currentMilestone
+            ? "APPROVED"
+            : i > order.currentMilestone || ["REQUESTED", "REJECTED", "CANCELLED", "EXPIRED"].includes(order.status)
+            ? "UPCOMING"
+            : order.status === "MILESTONE_REVIEW"
+            ? "IN_REVIEW"
+            : order.status === "MILESTONE_IN_PROGRESS"
+            ? "IN_PROGRESS"
+            : paid
+            ? "IN_PROGRESS"
+            : "WAITING_PAYMENT";
+        return { ...m, index: i, paid, state };
+      }),
       buyer,
       artist: { id: artistProfile.id, ...artistUser, defaultWatermarkMode: artistProfile.defaultWatermarkMode },
       isBuyer,
@@ -391,16 +534,20 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const user = await requireUser(request);
     const { order, isBuyer } = await loadOrderFor(request, user);
     if (!isBuyer) throw new HttpError(403, "Solo el comprador puede abonar");
-    const stage = expectedStage(order);
-    if (!stage) throw new HttpError(409, "No hay ningún pago pendiente en este momento");
-
-    const amount = stage === "FINAL_50" ? order.finalAmount : order.depositAmount;
-    const fee = milestoneFee(order, stage);
+    const pending = pendingPayment(order);
+    if (!pending) throw new HttpError(409, "No hay ningún pago pendiente en este momento");
+    const { stage, amount, fee, milestoneIndex } = pending;
 
     const [existing] = await db
       .select()
       .from(orderMilestonePayments)
-      .where(and(eq(orderMilestonePayments.orderId, order.id), eq(orderMilestonePayments.stage, stage)))
+      .where(
+        and(
+          eq(orderMilestonePayments.orderId, order.id),
+          eq(orderMilestonePayments.stage, stage),
+          eq(orderMilestonePayments.milestoneIndex, milestoneIndex)
+        )
+      )
       .limit(1);
     if (existing?.status === "APPROVED") throw new HttpError(409, "Este pago ya fue acreditado");
 
@@ -412,7 +559,7 @@ export async function orderRoutes(fastify: FastifyInstance) {
           .returning()
       : await db
           .insert(orderMilestonePayments)
-          .values({ orderId: order.id, stage, provider: "MERCADOPAGO", grossAmount: amount, marketplaceFee: fee })
+          .values({ orderId: order.id, stage, milestoneIndex, provider: "MERCADOPAGO", grossAmount: amount, marketplaceFee: fee })
           .returning();
 
     if (config.PAYMENTS_MODE === "mock") {
@@ -435,12 +582,12 @@ export async function orderRoutes(fastify: FastifyInstance) {
         sellerAccessToken: mp.token,
         milestoneId: milestone!.id,
         orderId: order.id,
-        title: neutralTitle(order.orderNumber, artistUser?.username ?? "artista", stage),
+        title: neutralTitle(order.orderNumber, artistUser?.username ?? "artista", pending.concept),
         amountArs: amount,
         marketplaceFeeArs: fee,
         payerEmail: user.email,
         expiresAt:
-          stage !== "FINAL_50" && order.acceptedAt
+          order.status === "ACCEPTED_WAITING_DEPOSIT" && order.acceptedAt
             ? new Date(order.acceptedAt.getTime() + config.DEPOSIT_EXPIRATION_HOURS * 3600_000)
             : undefined
       });
@@ -483,10 +630,10 @@ export async function orderRoutes(fastify: FastifyInstance) {
     if (!isArtist) throw new HttpError(403, "Solo el artista puede subir bocetos");
     assertStatus(order, "IN_PROGRESS_SKETCH");
 
-    const file = await request.file({ limits: { fileSize: 30 * 1024 * 1024 } });
+    const file = await request.file({ limits: { fileSize: LIMITS.sketchBytes } });
     if (!file) throw new HttpError(400, "Archivo requerido");
-    const buffer = await file.toBuffer();
-    if (file.file.truncated) throw new HttpError(413, "El boceto supera los 30 MB");
+    const buffer = await file.toBuffer().catch(() => null);
+    if (!buffer || file.file.truncated) throw new HttpError(413, `El boceto supera los ${LIMITS_MB.sketch} MB`);
     await WatermarkService.assertImage(buffer).catch((e: Error) => {
       throw new HttpError(400, e.message);
     });
@@ -524,14 +671,19 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const user = await requireUser(request);
     const { order, isBuyer } = await loadOrderFor(request, user);
     if (!isBuyer) throw new HttpError(403, "Solo el comprador puede pedir cambios");
-    assertStatus(order, "SKETCH_REVIEW", "FINAL_PREVIEW_REVIEW");
+    assertStatus(order, "SKETCH_REVIEW", "FINAL_PREVIEW_REVIEW", "MILESTONE_REVIEW");
     const { feedback } = parseBody(z.object({ feedback: z.string().trim().min(3).max(2000) }), request.body);
 
     const included = order.serviceSnapshot.revisionsIncluded;
     if (order.revisionsUsed >= included) {
       throw new HttpError(409, `Ya usaste las ${included} revisiones incluidas. Coordiná ajustes extra con el artista por el chat.`);
     }
-    const next = order.status === "FINAL_PREVIEW_REVIEW" ? "WORKING_FINAL" : "IN_PROGRESS_SKETCH";
+    const next =
+      order.status === "FINAL_PREVIEW_REVIEW"
+        ? "WORKING_FINAL"
+        : order.status === "MILESTONE_REVIEW"
+        ? "MILESTONE_IN_PROGRESS"
+        : "IN_PROGRESS_SKETCH";
     const updated = await db.transaction(async (tx) => {
       const o = await transition(tx, order.id, order.status, next, { revisionsUsed: order.revisionsUsed + 1 });
       await tx.insert(orderMessages).values({ orderId: order.id, senderId: user.id, type: "TEXT", content: `🔄 Pedido de ajustes: ${feedback}` });
@@ -568,8 +720,9 @@ export async function orderRoutes(fastify: FastifyInstance) {
 
   // ───────────────────────────────────────────────────────────
   // POST /api/orders/:id/deliver-final — doble archivo (Plan §3.A)
-  //   file    = original HD (PNG/JPG/WebP/ZIP/PSD) → bucket privado
-  //   preview = imagen para la vista previa (opcional si `file` es imagen)
+  //   file    = original HD: imagen (PNG/JPG/WebP) o paquete .zip / .rar / .psd → bucket privado
+  //   preview = imagen para la vista previa (obligatoria si `file` no es una imagen)
+  // El original se escribe a un archivo temporal y se sube por streaming: nunca entra entero en memoria.
   // ───────────────────────────────────────────────────────────
   fastify.post("/:id/deliver-final", async (request) => {
     const user = await requireUser(request);
@@ -577,47 +730,10 @@ export async function orderRoutes(fastify: FastifyInstance) {
     if (!isArtist) throw new HttpError(403, "Solo el artista puede entregar");
     assertStatus(order, "WORKING_FINAL");
 
-    let hd: { buffer: Buffer; filename: string; mimetype: string } | null = null;
-    let previewSource: Buffer | null = null;
-    let mode = artistProfile.defaultWatermarkMode;
-    for await (const part of request.parts({ limits: { fileSize: MAX_DELIVERY_BYTES, files: 2 } })) {
-      if (part.type === "file") {
-        const buffer = await part.toBuffer();
-        if (part.file.truncated) throw new HttpError(413, "El archivo supera los 200 MB");
-        if (part.fieldname === "file") hd = { buffer, filename: part.filename, mimetype: part.mimetype };
-        else if (part.fieldname === "preview") previewSource = buffer;
-      } else if (part.fieldname === "watermarkMode") {
-        mode = z.enum(["MANUAL", "AUTO_TEXT", "AUTO_AVATAR"]).catch(mode).parse(part.value);
-      }
-    }
-    if (!hd) throw new HttpError(400, "Subí el archivo final en alta definición");
-
-    const hdIsImage = await WatermarkService.assertImage(hd.buffer).then(() => true, () => false);
-    const source = previewSource ?? (hdIsImage ? hd.buffer : null);
-    if (!source) throw new HttpError(400, "Si el original no es una imagen (ZIP/PSD), subí también una imagen de vista previa");
-    await WatermarkService.assertImage(source).catch((e: Error) => {
-      throw new HttpError(400, e.message);
-    });
-
-    const hdType = hdIsImage ? hd.mimetype : hd.filename.toLowerCase().endsWith(".zip") ? "application/zip" : hd.mimetype || "application/octet-stream";
-    const ext = hd.filename.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase() ?? extensionFor(hdType);
-    const hdKey = newKey(`orders/${order.id}/final`, ext);
-    const previewKey = newKey(`orders/${order.id}/preview`, "webp");
-
-    // Vista previa en baja resolución con marca de agua
-    const preview = await WatermarkService.apply(source, {
-      mode,
-      username: user.username,
-      customText: artistProfile.watermarkCustomText,
-      avatar: mode === "AUTO_AVATAR" ? await loadAvatar(user.image) : null,
-      maxWidth: 1000
-    });
-    await storage.put("private", hdKey, hd.buffer, hdType);
-    await storage.put("private", previewKey, preview, "image/webp");
+    const { hdKey, previewKey, safeName } = await receiveFinalDelivery(request, order, artistProfile, user);
 
     // FULL_100 y SPLIT_ON_SKETCH ya están pagos al 100% → se destraba directo
     const next = order.paymentPlanSnapshot === "SPLIT_ON_FINAL_PREVIEW" ? "FINAL_PREVIEW_REVIEW" : "COMPLETED_HD_UNLOCKED";
-    const safeName = `${order.orderNumber}-${hd.filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80)}`;
 
     const updated = await db.transaction(async (tx) => {
       const o = await transition(tx, order.id, "WORKING_FINAL", next, {
@@ -643,6 +759,109 @@ export async function orderRoutes(fastify: FastifyInstance) {
       "buyer",
       next === "FINAL_PREVIEW_REVIEW" ? "Tu obra está terminada" : "¡Tu comisión está lista!",
       next === "FINAL_PREVIEW_REVIEW" ? "Revisá la vista previa, aprobala y aboná el saldo para descargar el original HD." : "Ya podés descargar tu ilustración en alta definición."
+    );
+    return { ok: true, nextStatus: updated.status };
+  });
+
+  // ───────────────────────────────────────────────────────────
+  // Plan MILESTONES — POST /api/orders/:id/milestones/deliver
+  //   Etapas intermedias: una imagen de avance (se muestra con marca de agua).
+  //   Última etapa: la entrega final (original HD o paquete + vista previa), igual que deliver-final.
+  // ───────────────────────────────────────────────────────────
+  fastify.post("/:id/milestones/deliver", async (request) => {
+    const user = await requireUser(request);
+    const { order, artistProfile, isArtist } = await loadOrderFor(request, user);
+    if (!isArtist) throw new HttpError(403, "Solo el artista puede entregar una etapa");
+    assertStatus(order, "MILESTONE_IN_PROGRESS");
+
+    const index = order.currentMilestone;
+    const total = order.milestonesSnapshot.length;
+    const milestone = order.milestonesSnapshot[index];
+    if (!milestone) throw new HttpError(409, "El pedido no tiene esa etapa");
+    const isLast = index === total - 1;
+
+    let attachmentKey: string;
+    let extra: Partial<typeof commissionOrders.$inferInsert> = {};
+    if (isLast) {
+      const delivery = await receiveFinalDelivery(request, order, artistProfile, user);
+      attachmentKey = delivery.previewKey;
+      extra = {
+        previewWatermarkedKey: delivery.previewKey,
+        finalHdPrivateKey: delivery.hdKey,
+        finalHdFilename: delivery.safeName
+      };
+    } else {
+      const file = await request.file({ limits: { fileSize: LIMITS.sketchBytes } });
+      if (!file) throw new HttpError(400, "Archivo requerido");
+      const buffer = await file.toBuffer().catch(() => null);
+      if (!buffer || file.file.truncated) throw new HttpError(413, `El avance supera los ${LIMITS_MB.sketch} MB`);
+      await WatermarkService.assertImage(buffer).catch((e: Error) => {
+        throw new HttpError(400, e.message);
+      });
+      const mode = z.enum(["MANUAL", "AUTO_TEXT", "AUTO_AVATAR"]).catch(artistProfile.defaultWatermarkMode).parse(multipartField(file, "watermarkMode"));
+      const watermarked = await WatermarkService.apply(buffer, {
+        mode,
+        username: user.username,
+        customText: artistProfile.watermarkCustomText,
+        avatar: mode === "AUTO_AVATAR" ? await loadAvatar(user.image) : null,
+        maxWidth: 1400
+      });
+      attachmentKey = newKey(`orders/${order.id}/milestone-${index + 1}`, "webp");
+      await storage.put("private", attachmentKey, watermarked, "image/webp");
+    }
+
+    const updated = await db.transaction(async (tx) => {
+      const o = await transition(tx, order.id, "MILESTONE_IN_PROGRESS", "MILESTONE_REVIEW", extra);
+      await tx.insert(orderMessages).values({
+        orderId: order.id,
+        senderId: user.id,
+        type: "MILESTONE_SUBMISSION",
+        content: isLast
+          ? `🎨 El artista entregó la etapa final (${index + 1}/${total}: "${milestone.title}"). Revisá la vista previa con marca de agua; al aprobarla se desbloquea el original.`
+          : `📦 El artista entregó la etapa ${index + 1}/${total}: "${milestone.title}". Revisala y aprobala para pasar a la siguiente.`,
+        attachments: [attachmentKey]
+      });
+      return o;
+    });
+    void notifyOrder(updated, "buyer", `Etapa ${index + 1} de ${total} lista para revisar`, `El artista entregó "${milestone.title}". Aprobala o pedí ajustes desde la sala del pedido.`);
+    return { ok: true, status: updated.status };
+  });
+
+  // POST /api/orders/:id/milestones/approve — el comprador aprueba la etapa en revisión
+  fastify.post("/:id/milestones/approve", async (request) => {
+    const user = await requireUser(request);
+    const { order, isBuyer } = await loadOrderFor(request, user);
+    if (!isBuyer) throw new HttpError(403, "Solo el comprador puede aprobar una etapa");
+    assertStatus(order, "MILESTONE_REVIEW");
+
+    const index = order.currentMilestone;
+    const total = order.milestonesSnapshot.length;
+    const isLast = index === total - 1;
+    const nextMilestone = order.milestonesSnapshot[index + 1];
+
+    const updated = await db.transaction(async (tx) => {
+      if (isLast) {
+        // Todas las etapas se pagan por adelantado: verificamos el 100% antes de liberar el original
+        const payments = await tx.select().from(orderMilestonePayments).where(eq(orderMilestonePayments.orderId, order.id));
+        const paid = payments.filter((p) => p.status === "APPROVED").reduce((acc, p) => acc + p.grossAmount, 0);
+        if (paid < order.totalAmount) throw new HttpError(409, "Todavía hay etapas sin pagar");
+        const o = await transition(tx, order.id, "MILESTONE_REVIEW", "COMPLETED_HD_UNLOCKED", { completedAt: new Date() });
+        await addSystemMessage(tx, order.id, "🎉 Etapa final aprobada. ¡Se desbloqueó la descarga del archivo original!");
+        return o;
+      }
+      const o = await transition(tx, order.id, "MILESTONE_REVIEW", "MILESTONE_WAITING_PAYMENT", { currentMilestone: index + 1 });
+      await addSystemMessage(
+        tx,
+        order.id,
+        `✅ Etapa ${index + 1}/${total} aprobada. Próximo paso: abonar la etapa ${index + 2} ("${nextMilestone!.title}", $${nextMilestone!.amount.toLocaleString("es-AR")} ARS) para que el artista la empiece.`
+      );
+      return o;
+    });
+    void notifyOrder(
+      updated,
+      "artist",
+      isLast ? "¡Pedido completado!" : `Etapa ${index + 1} aprobada`,
+      isLast ? "El comprador aprobó la etapa final." : "El comprador aprobó la etapa y debe abonar la siguiente para que puedas continuar."
     );
     return { ok: true, nextStatus: updated.status };
   });

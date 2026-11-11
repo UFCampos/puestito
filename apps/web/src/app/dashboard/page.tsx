@@ -3,7 +3,13 @@
 import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { apiFetch, API_URL, PLAN_LABEL, STATUS_LABEL, resolveImageUrl } from "../../lib/api";
+import { apiFetch, API_URL, STATUS_LABEL, fileTooLarge, planSummary, resolveImageUrl } from "../../lib/api";
+import { useAppConfig } from "../../lib/useAppConfig";
+
+const SERVICE_FEEDBACK: Record<string, string> = {
+  created: "✅ ¡Comisión publicada en tu puestito!",
+  updated: "✅ Cambios guardados."
+};
 
 const MP_FEEDBACK: Record<string, string> = {
   connected: "✅ ¡Mercado Pago vinculado! Ya podés cobrar con split automático.",
@@ -13,17 +19,6 @@ const MP_FEEDBACK: Record<string, string> = {
   error: "⚠️ Mercado Pago no respondió. Probá de nuevo en unos minutos."
 };
 
-function parseAddons(text: string) {
-  return text
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [name, price] = line.split("|").map((p) => p.trim());
-      return { name, priceArs: Math.round(Number((price || "").replace(/[^0-9]/g, ""))) };
-    })
-    .filter((a) => a.name && Number.isFinite(a.priceArs));
-}
 
 export default function ArtistDashboardPageWrapper() {
   return (
@@ -64,17 +59,8 @@ function ArtistDashboardPage() {
   const [portFile, setPortFile] = useState<File | null>(null);
 
   // New commission service state
-  const [srvTitle, setSrvTitle] = useState("");
-  const [srvDescription, setSrvDescription] = useState("");
-  const [srvPriceArs, setSrvPriceArs] = useState("25000");
-  const [srvPriceUsd, setSrvPriceUsd] = useState("20");
-  const [srvTurnaroundDays, setSrvTurnaroundDays] = useState("7");
-  const [srvMaxRevisions, setSrvMaxRevisions] = useState("2");
-  const [srvSlotsMax, setSrvSlotsMax] = useState("5");
-  const [srvPaymentPlan, setSrvPaymentPlan] = useState("SPLIT_ON_SKETCH");
-  const [srvRating, setSrvRating] = useState("SFW");
-  const [srvTags, setSrvTags] = useState("");
-  const [srvAddons, setSrvAddons] = useState("Personaje adicional | 15000\nFondo detallado | 10000");
+  const [services, setServices] = useState<any[]>([]);
+  const cfg = useAppConfig();
 
   async function loadAll() {
     try {
@@ -87,8 +73,9 @@ function ArtistDashboardPage() {
       setHasArtistProfile(Boolean(me.artistProfile));
       if (!me.artistProfile) return;
 
-      const [sf, payStatus, myOrders] = await Promise.all([
+      const [sf, myServices, payStatus, myOrders] = await Promise.all([
         apiFetch<any>(`/api/artists/${me.user.username}`).catch(() => null),
+        apiFetch<any>("/api/artists/me/services").catch(() => ({ services: [] })),
         apiFetch<any>("/api/payments/status").catch(() => null),
         apiFetch<any>("/api/orders").catch(() => ({ orders: [] })),
       ]);
@@ -104,6 +91,7 @@ function ArtistDashboardPage() {
         setTwitter(sf.artist.socialLinks?.twitter || "");
         setInstagram(sf.artist.socialLinks?.instagram || "");
       }
+      setServices(myServices.services || []);
       setMpConnected(Boolean(payStatus?.mercadopago?.connected));
       setPaymentsMode(payStatus?.paymentsMode ?? "live");
       setOrders((myOrders.orders || []).filter((o: any) => o.role === "ARTIST"));
@@ -116,6 +104,8 @@ function ArtistDashboardPage() {
     loadAll();
     const mp = searchParams.get("mp");
     if (mp && MP_FEEDBACK[mp]) setFeedback(MP_FEEDBACK[mp]);
+    const svc = searchParams.get("service");
+    if (svc && SERVICE_FEEDBACK[svc]) setFeedback(SERVICE_FEEDBACK[svc]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -141,6 +131,11 @@ function ArtistDashboardPage() {
 
   async function handleUploadImage(kind: "avatar" | "banner", file: File | undefined) {
     if (!file) return;
+    const tooLarge = fileTooLarge(file, cfg.uploadLimitsMb.avatar);
+    if (tooLarge) {
+      alert(tooLarge);
+      return;
+    }
     setSaving(true);
     try {
       const formData = new FormData();
@@ -212,6 +207,12 @@ function ArtistDashboardPage() {
         setSaving(false);
         return;
       }
+      const tooLarge = fileTooLarge(portFile, cfg.uploadLimitsMb.portfolio);
+      if (tooLarge) {
+        alert(tooLarge);
+        setSaving(false);
+        return;
+      }
       // Los campos van antes del archivo para que el servidor los lea junto con él
       const formData = new FormData();
       formData.append("title", portTitle);
@@ -246,41 +247,32 @@ function ArtistDashboardPage() {
     await loadAll();
   }
 
-  async function handleCreateService(e: React.FormEvent) {
-    e.preventDefault();
-    setSaving(true);
+  async function handleToggleService(srv: any) {
     try {
-      await apiFetch("/api/artists/services", {
-        method: "POST",
-        body: JSON.stringify({
-          title: srvTitle,
-          description: srvDescription,
-          priceArs: Number(srvPriceArs),
-          turnaroundDays: Number(srvTurnaroundDays),
-          revisionsIncluded: Number(srvMaxRevisions),
-          maxSlots: Number(srvSlotsMax),
-          paymentPlan: srvPaymentPlan,
-          rating: srvRating,
-          priceUsd: srvPriceUsd ? Number(srvPriceUsd) : null,
-          tags: srvTags.split(",").map((t) => t.trim()).filter(Boolean),
-          addons: parseAddons(srvAddons),
-        }),
+      await apiFetch(`/api/artists/services/${srv.id}/status`, {
+        method: "PATCH",
+        body: JSON.stringify({ isActive: !srv.isActive })
       });
-      setSrvTitle("");
-      setSrvDescription("");
-      setFeedback("✅ ¡Servicio de comisión publicado en tu puesto!");
+      setFeedback(srv.isActive ? "⏸️ Comisión pausada: ya no recibe pedidos nuevos." : "✅ Comisión publicada de nuevo.");
       await loadAll();
     } catch (err: any) {
       alert(err.message);
-    } finally {
-      setSaving(false);
     }
   }
 
-  async function handleDeleteService(serviceId: string) {
-    if (!confirm("¿Eliminar este servicio de comisión?")) return;
-    await apiFetch(`/api/artists/services/${serviceId}`, { method: "DELETE" });
-    await loadAll();
+  async function handleDeleteService(srv: any) {
+    const warning =
+      srv.totalOrders > 0
+        ? `"${srv.title}" ya tiene pedidos, así que no se puede borrar: va a quedar pausada. ¿Continuar?`
+        : `¿Eliminar "${srv.title}"? No se puede deshacer.`;
+    if (!confirm(warning)) return;
+    try {
+      const res = await apiFetch<{ deleted: boolean }>(`/api/artists/services/${srv.id}`, { method: "DELETE" });
+      setFeedback(res.deleted ? "🗑️ Comisión eliminada." : "⏸️ La comisión tiene pedidos: quedó pausada.");
+      await loadAll();
+    } catch (err: any) {
+      alert(err.message);
+    }
   }
 
   if (loading) {
@@ -333,7 +325,7 @@ function ArtistDashboardPage() {
   const hasProfile = Boolean(bio && termsOfService);
   const hasPortfolio = (storefront?.portfolio?.length || 0) > 0;
   const hasMP = mpConnected;
-  const hasServices = (storefront?.services?.length || 0) > 0;
+  const hasServices = services.some((srv) => srv.isActive);
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
@@ -426,6 +418,83 @@ function ArtistDashboardPage() {
               </Link>
             ))}
           </div>
+        )}
+      </div>
+
+      {/* Mis comisiones */}
+      <div className="mt-8 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900">🛠️ Mis comisiones ({services.length})</h2>
+            <p className="text-xs text-slate-600">Lo que ofrecés en tu puestito: precio, extras y forma de cobro.</p>
+          </div>
+          <Link
+            href="/dashboard/services/new"
+            className="rounded-xl bg-purple-600 px-4 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-purple-700"
+          >
+            + Nueva comisión
+          </Link>
+        </div>
+
+        {services.length === 0 ? (
+          <div className="mt-4 rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-8 text-center">
+            <p className="text-sm font-bold text-slate-800">Todavía no publicaste ninguna comisión</p>
+            <p className="mt-1 text-xs text-slate-500">Armala en unos pasos: descripción, precio, extras y forma de cobro.</p>
+          </div>
+        ) : (
+          <ul className="mt-4 grid gap-4 md:grid-cols-2">
+            {services.map((srv: any) => (
+              <li
+                key={srv.id}
+                className={`flex flex-col rounded-2xl border p-4 ${srv.isActive ? "border-slate-200" : "border-slate-200 bg-slate-50"}`}
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span
+                    className={`rounded-full px-2.5 py-0.5 text-[11px] font-bold ${
+                      srv.isActive ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-600"
+                    }`}
+                  >
+                    {srv.isActive ? "Publicada" : "Pausada"}
+                  </span>
+                  <span className="rounded-full bg-purple-50 px-2.5 py-0.5 text-[11px] font-bold text-purple-700">
+                    {planSummary(srv.paymentPlan, srv.milestones)}
+                  </span>
+                  <span className="text-[11px] font-semibold text-slate-400">{srv.rating}</span>
+                </div>
+                <h3 className="mt-2 font-bold text-slate-900">{srv.title}</h3>
+                <p className="mt-1 line-clamp-2 text-xs text-slate-600">{srv.description}</p>
+                <p className="mt-2 text-base font-extrabold text-slate-900">
+                  ${Number(srv.priceArs).toLocaleString("es-AR")} ARS
+                </p>
+                <p className="mt-1 text-[11px] text-slate-500">
+                  {srv.turnaroundDays} días · {srv.revisionsIncluded} rev. · Cupos {srv.slotsTaken}/{srv.maxSlots} ·{" "}
+                  {srv.addons?.length ?? 0} extras · {srv.totalOrders} pedidos
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3">
+                  <Link
+                    href={`/dashboard/services/${srv.id}/edit`}
+                    className="rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-bold text-white hover:bg-slate-800"
+                  >
+                    ✏️ Editar
+                  </Link>
+                  <button
+                    type="button"
+                    onClick={() => handleToggleService(srv)}
+                    className="rounded-lg border border-slate-200 px-3.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                  >
+                    {srv.isActive ? "⏸️ Pausar" : "▶️ Publicar"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteService(srv)}
+                    className="rounded-lg px-3 py-1.5 text-xs font-semibold text-rose-600 hover:bg-rose-50"
+                  >
+                    Eliminar
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
         )}
       </div>
 
@@ -612,119 +681,12 @@ function ArtistDashboardPage() {
             </div>
           </div>
 
-          {/* Create Commission Service */}
-          <form onSubmit={handleCreateService} className="space-y-3 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-            <h2 className="text-lg font-bold text-slate-900">🛠️ 3. Publicar Servicio de Comisión</h2>
-            <div>
-              <label className="mb-1 block text-xs font-bold text-slate-700">Título del Servicio</label>
-              <input
-                type="text"
-                required
-                value={srvTitle}
-                onChange={(e) => setSrvTitle(e.target.value)}
-                placeholder="Ej: Ilustración Fullbody Anime / VTuber"
-                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-bold text-slate-700">Descripción (Qué incluye y qué no)</label>
-              <textarea
-                rows={2}
-                required
-                value={srvDescription}
-                onChange={(e) => setSrvDescription(e.target.value)}
-                placeholder="Incluye personaje a color con fondo simple, archivo PNG 300 DPI..."
-                className="w-full rounded-xl border border-slate-200 p-2.5 text-xs"
-              />
-            </div>
-            <div className="grid grid-cols-3 gap-2">
-              <div>
-                <label className="mb-1 block text-xs font-bold text-slate-700">Precio Base (ARS)</label>
-                <input
-                  type="number"
-                  required
-                  value={srvPriceArs}
-                  onChange={(e) => setSrvPriceArs(e.target.value)}
-                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs font-bold text-slate-700">Precio USD (Opcional)</label>
-                <input
-                  type="number"
-                  value={srvPriceUsd}
-                  onChange={(e) => setSrvPriceUsd(e.target.value)}
-                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs font-bold text-slate-700">Cupos (Slots)</label>
-                <input
-                  type="number"
-                  required
-                  value={srvSlotsMax}
-                  onChange={(e) => setSrvSlotsMax(e.target.value)}
-                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-3 gap-2">
-              <div>
-                <label className="mb-1 block text-xs font-bold text-slate-700">Plazo (días)</label>
-                <input type="number" min={1} required value={srvTurnaroundDays} onChange={(e) => setSrvTurnaroundDays(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs font-bold text-slate-700">Revisiones</label>
-                <input type="number" min={0} required value={srvMaxRevisions} onChange={(e) => setSrvMaxRevisions(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs font-bold text-slate-700">Clasificación</label>
-                <select value={srvRating} onChange={(e) => setSrvRating(e.target.value)} className="w-full rounded-xl border border-slate-200 px-2 py-2 text-xs font-semibold">
-                  <option value="SFW">SFW</option>
-                  <option value="SUGGESTIVE">Suggestive</option>
-                  <option value="NSFW">NSFW +18</option>
-                </select>
-              </div>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-bold text-slate-700">Tags (separados por coma)</label>
-              <input type="text" value={srvTags} onChange={(e) => setSrvTags(e.target.value)} placeholder="anime, vtuber, chibi" className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs" />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-bold text-slate-700">Extras (uno por línea: Nombre | precio ARS)</label>
-              <textarea rows={3} value={srvAddons} onChange={(e) => setSrvAddons(e.target.value)} className="w-full rounded-xl border border-slate-200 p-2.5 text-xs font-mono" />
-            </div>
-
-            <div>
-              <label className="mb-1 block text-xs font-bold text-slate-700">
-                Modalidad de Cobro (Elegida por vos para este servicio)
-              </label>
-              <select
-                value={srvPaymentPlan}
-                onChange={(e) => setSrvPaymentPlan(e.target.value)}
-                className="w-full rounded-xl border border-purple-200 bg-purple-50/40 px-3 py-2 text-xs font-bold text-slate-900"
-              >
-                <option value="SPLIT_ON_SKETCH">50% Seña Inicial + 50% al aprobar el Boceto (Recomendado)</option>
-                <option value="SPLIT_ON_FINAL_PREVIEW">50% Seña Inicial + 50% al aprobar Previa Final (antes de liberar HD)</option>
-                <option value="FULL_100">100% Pago Único Anticipado al aceptar el pedido</option>
-              </select>
-            </div>
-
-            <button
-              type="submit"
-              disabled={saving}
-              className="w-full rounded-xl bg-slate-900 py-2.5 text-sm font-bold text-white hover:bg-slate-800 disabled:opacity-50"
-            >
-              + Publicar Servicio en Mi Puesto
-            </button>
-          </form>
         </div>
       </div>
 
       {/* Portfolio Upload & Management */}
       <div className="mt-8 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-        <h2 className="text-lg font-bold text-slate-900">🖼️ 4. Gestor de Portfolio con Marca de Agua Automática</h2>
+        <h2 className="text-lg font-bold text-slate-900">🖼️ 3. Gestor de Portfolio con Marca de Agua Automática</h2>
         <form onSubmit={handleAddPortfolio} className="mt-4 grid gap-3 rounded-2xl border border-slate-100 bg-slate-50 p-4 sm:grid-cols-6">
           <input
             type="text"
@@ -799,36 +761,6 @@ function ArtistDashboardPage() {
         </div>
       </div>
 
-      {/* Active Services List */}
-      <div className="mt-8 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-        <h2 className="text-lg font-bold text-slate-900">📋 Mis Servicios Publicados ({storefront?.services?.length || 0})</h2>
-        <div className="mt-4 grid gap-4 sm:grid-cols-2">
-          {storefront?.services?.map((srv: any) => (
-            <div key={srv.id} className="flex items-start justify-between rounded-2xl border border-slate-200 p-4">
-              <div>
-                <span className="rounded-full bg-purple-50 px-2.5 py-0.5 text-[11px] font-bold text-purple-700">
-                  {PLAN_LABEL[srv.paymentPlan] ?? srv.paymentPlan}
-                </span>
-                <h3 className="mt-1 font-bold text-slate-900">{srv.title}</h3>
-                <p className="mt-1 text-xs text-slate-600">{srv.description}</p>
-                <p className="mt-2 text-sm font-extrabold text-slate-900">
-                  ${Number(srv.priceArs).toLocaleString("es-AR")} ARS
-                </p>
-                <p className="mt-1 text-[11px] text-slate-500">
-                  Cupos ocupados: {srv.slotsTaken}/{srv.maxSlots} · Extras: {srv.addons?.length ?? 0} · {srv.rating}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => handleDeleteService(srv.id)}
-                className="text-xs font-semibold text-rose-600 hover:underline"
-              >
-                Eliminar
-              </button>
-            </div>
-          ))}
-        </div>
-      </div>
     </div>
   );
 }

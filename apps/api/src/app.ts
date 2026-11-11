@@ -8,6 +8,7 @@ import { config, isProd } from "./config.js";
 import { auth } from "./auth.js";
 import { HttpError } from "./lib/http.js";
 import { pool } from "./db/index.js";
+import { LIMITS, LIMITS_MB } from "./lib/limits.js";
 import { meRoutes } from "./routes/me.routes.js";
 import { artistRoutes } from "./routes/artist.routes.js";
 import { orderRoutes } from "./routes/order.routes.js";
@@ -38,7 +39,8 @@ export async function buildApp() {
   });
   await app.register(cookie, { secret: config.BETTER_AUTH_SECRET });
   await app.register(rateLimit, { max: 300, timeWindow: "1 minute" });
-  await app.register(multipart, { limits: { fileSize: 30 * 1024 * 1024, files: 2, fields: 20 } });
+  // Límite por defecto; cada ruta fija el suyo (ver src/lib/limits.ts)
+  await app.register(multipart, { limits: { fileSize: LIMITS.sketchBytes, files: 2, fields: 20 } });
 
   app.setErrorHandler((error: FastifyError | HttpError, request, reply) => {
     if (error instanceof HttpError) return reply.status(error.statusCode).send({ error: error.message });
@@ -56,6 +58,14 @@ export async function buildApp() {
     await pool.query("select 1");
     return { status: "ok", app: "TuPuestito API", version: "1.0.0", timestamp: new Date().toISOString() };
   });
+
+  // Límites y reglas que el frontend muestra y valida antes de subir
+  app.get("/api/config", async () => ({
+    uploadLimitsMb: LIMITS_MB,
+    finalDeliveryFormats: ["png", "jpg", "webp", "zip", "rar", "psd"],
+    platformFeePercent: config.PLATFORM_FEE_PERCENT,
+    depositExpirationHours: config.DEPOSIT_EXPIRATION_HOURS
+  }));
 
   // ── Better Auth (email+password, Google, Discord, username) ──
   app.route({

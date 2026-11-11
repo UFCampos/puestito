@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import path from "node:path";
 import {
   S3Client,
@@ -31,6 +32,7 @@ const EXT_BY_TYPE: Record<string, string> = {
   "image/jpeg": "jpg",
   "image/webp": "webp",
   "application/zip": "zip",
+  "application/vnd.rar": "rar",
   "image/vnd.adobe.photoshop": "psd"
 };
 
@@ -111,6 +113,27 @@ export const storage = {
     const file = localPath(visibility, key);
     await fs.mkdir(path.dirname(file), { recursive: true });
     await fs.writeFile(file, body);
+    await fs.writeFile(`${file}.meta`, contentType);
+  },
+
+  /** Sube un archivo desde disco por streaming (entregas grandes: no se cargan en memoria) */
+  async putFile(visibility: Visibility, key: string, filePath: string, size: number, contentType: string) {
+    if (s3) {
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: bucketFor(visibility),
+          Key: key,
+          Body: createReadStream(filePath),
+          ContentLength: size,
+          ContentType: contentType,
+          CacheControl: visibility === "public" ? "public, max-age=31536000, immutable" : "private, no-store"
+        })
+      );
+      return;
+    }
+    const file = localPath(visibility, key);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.copyFile(filePath, file);
     await fs.writeFile(`${file}.meta`, contentType);
   },
 

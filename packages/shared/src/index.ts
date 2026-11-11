@@ -6,7 +6,8 @@ export type UserRole = z.infer<typeof UserRoleSchema>;
 export const CommissionPaymentPlanSchema = z.enum([
   "FULL_100",
   "SPLIT_ON_SKETCH",
-  "SPLIT_ON_FINAL_PREVIEW"
+  "SPLIT_ON_FINAL_PREVIEW",
+  "MILESTONES"
 ]);
 export type CommissionPaymentPlan = z.infer<typeof CommissionPaymentPlanSchema>;
 
@@ -28,10 +29,13 @@ export const CommissionOrderStatusSchema = z.enum([
   "FINAL_PREVIEW_REVIEW",
   "WAITING_PAYMENT_BEFORE_HD",
   "COMPLETED_HD_UNLOCKED",
-  "CANCELLED"
+  "CANCELLED",
+  "MILESTONE_WAITING_PAYMENT",
+  "MILESTONE_IN_PROGRESS",
+  "MILESTONE_REVIEW"
 ]);
 export type CommissionOrderStatus = z.infer<typeof CommissionOrderStatusSchema>;
 
 
-export const MilestoneStageSchema = z.enum(["FULL_100", "DEPOSIT_50", "FINAL_50"]);
+export const MilestoneStageSchema = z.enum(["FULL_100", "DEPOSIT_50", "FINAL_50", "MILESTONE"]);
 export type MilestoneStage = z.infer<typeof MilestoneStageSchema>;
