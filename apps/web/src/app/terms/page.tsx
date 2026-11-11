@@ -28,7 +28,7 @@ export default function TermsPage() {
           <section>
             <h2 className="text-lg font-bold text-slate-900">3. Respaldo Inmutable del Acuerdo (ToS Snapshot)</h2>
             <p className="mt-1">
-              Al enviar una solicitud de comisión, el comprador acepta explícitamente los Términos de Servicio particulares del artista y el plan de cobro configurado (<code>FULL_100</code>, <code>SPLIT_ON_SKETCH</code> o <code>SPLIT_ON_FINAL_PREVIEW</code>). TuPuestito guarda una copia inmutable de dicho acuerdo con fecha y hora exacta para proteger a ambas partes.
+              Al enviar una solicitud de comisión, el comprador acepta explícitamente los Términos de Servicio particulares del artista y el plan de cobro configurado por el artista (100% por adelantado; 50% de seña y 50% al aprobar el boceto o la vista previa final; o pago por etapas, donde cada etapa se abona antes de que el artista la empiece). TuPuestito guarda una copia inmutable de dicho acuerdo con fecha y hora exacta para proteger a ambas partes.
             </p>
           </section>
 

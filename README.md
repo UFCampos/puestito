@@ -6,6 +6,24 @@ La especificación de referencia es [`docs/business-planning/plan_tecnico_mvp.md
 
 ---
 
+## 🎬 Demos del Flujo Completo
+
+### 👤 Lado del Cliente (Comprador)
+Explorar artistas, registrarse, solicitar una comisión 50/50 con extras y referencias, pagar la seña, pedir ajustes sobre el boceto, aprobar la entrega, abonar el saldo restante, descargar el original en HD y dejar una reseña.
+
+<video src="https://raw.githubusercontent.com/UFCampos/puestito/feat/service-editor-and-delivery-packages/docs/demo/demo-cliente.mp4" controls width="100%"></video>
+
+> 💡 *Si tu visor de Markdown no reproduce el video en línea, podés [abrir `docs/demo/demo-cliente.mp4` directamente](./docs/demo/demo-cliente.mp4).*
+
+### 🎨 Lado del Artista
+Crear una nueva comisión por etapas (milestones) con el asistente tipo Fiverr, editar el precio de un servicio publicado, aceptar un pedido entrante, entregar cada etapa (incluyendo entrega final en `.zip` con vista previa protegida por marca de agua) y recibir la reseña en su vidriera pública.
+
+<video src="https://raw.githubusercontent.com/UFCampos/puestito/feat/service-editor-and-delivery-packages/docs/demo/demo-artista.mp4" controls width="100%"></video>
+
+> 💡 *Si tu visor de Markdown no reproduce el video en línea, podés [abrir `docs/demo/demo-artista.mp4` directamente](./docs/demo/demo-artista.mp4).*
+
+---
+
 ## 🧱 Stack (Plan §1)
 
 | Capa | Tecnología |
@@ -22,6 +40,14 @@ La especificación de referencia es [`docs/business-planning/plan_tecnico_mvp.md
 ## 🔄 Flujo del pedido (Plan §4)
 
 `REQUESTED → (REJECTED) | ACCEPTED_WAITING_DEPOSIT → (EXPIRED a las 72 hs) | IN_PROGRESS_SKETCH ⇄ SKETCH_REVIEW → [WAITING_PAYMENT_AFTER_SKETCH] → WORKING_FINAL → [FINAL_PREVIEW_REVIEW → WAITING_PAYMENT_BEFORE_HD] → COMPLETED_HD_UNLOCKED`
+
+### Formas de cobro que elige el artista por comisión
+
+| Plan | Cómo se cobra |
+|---|---|
+| `FULL_100` | 100% al aceptar el pedido. |
+| `SPLIT_ON_SKETCH` / `SPLIT_ON_FINAL_PREVIEW` | 50% de seña + 50% al aprobar el boceto **o** la vista previa final. En el editor es una sola opción con el momento del segundo pago configurable. |
+| `MILESTONES` | Pago por etapas: el artista define de 2 a 8 etapas (nombre, descripción, % y plazo; los % suman 100). Cada etapa se paga antes de empezarla y se aprueba al recibirla: `ACCEPTED_WAITING_DEPOSIT → MILESTONE_IN_PROGRESS → MILESTONE_REVIEW → MILESTONE_WAITING_PAYMENT → …`. La última etapa es la entrega final; al aprobarla se desbloquea el original. |
 
 - Los montos, extras y fees se calculan **solo en el servidor**; el pedido guarda un *snapshot* inmutable de ToS, plan de pago, servicio y extras.
 - El original HD vive en el bucket privado y **solo se entrega con una URL firmada de 5 minutos cuando el 100% figura `APPROVED`**.
@@ -56,6 +82,20 @@ pnpm test:e2e
 ```
 
 Levanta un PostgreSQL embebido (PGlite), corre las migraciones y el seed, y recorre el flujo completo: auth, explorar, referencias firmadas, pedido 50/50, marca de agua, bloqueo del HD, pagos, reseñas y controles de permisos.
+
+Corre en un entorno aislado (API en `:4100`, Postgres embebido en `:55432`), así que se puede ejecutar con `pnpm dev` abierto sin tocar tu base de desarrollo.
+
+### Límites de subida
+
+| Archivo | Formatos | Máximo | Variable |
+|---|---|---|---|
+| Referencias del comprador | PNG, JPG, WebP | 5 MB c/u (hasta 10) | fijo (Plan §6) |
+| Avatar / banner | PNG, JPG, WebP | 8 MB | `MAX_AVATAR_MB` |
+| Obra de portfolio | PNG, JPG, WebP | 25 MB | `MAX_PORTFOLIO_MB` |
+| Boceto y vista previa | PNG, JPG, WebP | 30 MB | `MAX_SKETCH_MB` |
+| Entrega final | PNG, JPG, WebP, **.zip**, **.rar**, .psd | 200 MB | `MAX_FINAL_DELIVERY_MB` |
+
+El formato de la entrega final se valida por el contenido del archivo, no por la extensión. Si es un paquete (.zip, .rar, .psd), el artista sube además una imagen para la vista previa con marca de agua. El frontend lee estos límites de `GET /api/config` y avisa antes de subir.
 
 ### Migraciones
 

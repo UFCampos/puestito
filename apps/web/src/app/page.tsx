@@ -10,7 +10,7 @@ interface CommissionServiceItem {
   description: string;
   priceArs: number;
   priceUsd?: number | null;
-  paymentPlan: "FULL_100" | "SPLIT_ON_SKETCH" | "SPLIT_ON_FINAL_PREVIEW";
+  paymentPlan: "FULL_100" | "SPLIT_ON_SKETCH" | "SPLIT_ON_FINAL_PREVIEW" | "MILESTONES";
   turnaroundDays: number;
   maxSlots: number;
   revisionsIncluded: number;
@@ -339,9 +339,9 @@ export default function HomePage() {
                                 <span className="ml-2 rounded bg-purple-100 px-1.5 py-0.5 text-[10px] font-medium text-purple-800">
                                   {srv.paymentPlan === "FULL_100"
                                     ? "100% inicial"
-                                    : srv.paymentPlan === "SPLIT_ON_SKETCH"
-                                    ? "50/50 en Boceto"
-                                    : "50/50 en Preview Final"}
+                                    : srv.paymentPlan === "MILESTONES"
+                                    ? "Por etapas"
+                                    : "50% + 50%"}
                                 </span>
                               </div>
                               <span className="whitespace-nowrap font-bold text-purple-700">

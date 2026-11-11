@@ -20,7 +20,7 @@ function escapeXml(s: string): string {
 
 export class WatermarkService {
   /** Valida que el buffer sea una imagen que sharp pueda leer */
-  static async assertImage(input: Buffer): Promise<void> {
+  static async assertImage(input: Buffer | string): Promise<void> {
     const meta = await sharp(input).metadata().catch(() => null);
     if (!meta?.width || !meta.height || !["png", "jpeg", "webp", "gif", "avif", "tiff"].includes(meta.format ?? "")) {
       throw new Error("El archivo no es una imagen válida (PNG, JPG o WebP)");
@@ -42,7 +42,7 @@ export class WatermarkService {
    *  - AUTO_TEXT: patrón SVG en diagonal (30°) repetido con `@username • MUESTRA TuPuestito - NO USAR`.
    *  - AUTO_AVATAR: sello con el avatar del artista + @username, en mosaico.
    */
-  static async apply(input: Buffer, options: WatermarkOptions): Promise<Buffer> {
+  static async apply(input: Buffer | string, options: WatermarkOptions): Promise<Buffer> {
     const maxWidth = options.maxWidth ?? 1600;
 
     // 1. Redimensionar primero: el overlay se construye con las dimensiones finales.

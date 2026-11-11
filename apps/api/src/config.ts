@@ -61,7 +61,14 @@ const EnvSchema = z.object({
   DISCORD_WEBHOOK_URL: z.string().url().optional(),
 
   // ── Reglas de negocio ──
-  DEPOSIT_EXPIRATION_HOURS: z.coerce.number().default(72)
+  DEPOSIT_EXPIRATION_HOURS: z.coerce.number().default(72),
+
+  // ── Límites de subida (MB por archivo) ──
+  MAX_AVATAR_MB: z.coerce.number().int().min(1).max(50).default(8),
+  MAX_PORTFOLIO_MB: z.coerce.number().int().min(1).max(100).default(25),
+  MAX_SKETCH_MB: z.coerce.number().int().min(1).max(100).default(30),
+  /** Entrega final (imagen, .zip, .rar o .psd). Si lo subís, ajustá también request_body en deploy/Caddyfile */
+  MAX_FINAL_DELIVERY_MB: z.coerce.number().int().min(1).max(2000).default(200)
 });
 
 const parsed = EnvSchema.safeParse(process.env);

@@ -31,7 +31,8 @@ type SeedService = {
   description: string;
   priceArs: number;
   priceUsd?: number;
-  paymentPlan: "FULL_100" | "SPLIT_ON_SKETCH" | "SPLIT_ON_FINAL_PREVIEW";
+  paymentPlan: "FULL_100" | "SPLIT_ON_SKETCH" | "SPLIT_ON_FINAL_PREVIEW" | "MILESTONES";
+  milestones?: { title: string; description: string; percent: number; days: number }[];
   turnaroundDays: number;
   maxSlots: number;
   revisionsIncluded: number;
@@ -130,6 +131,25 @@ async function main() {
         rating: "SUGGESTIVE",
         tags: ["Fullbody", "Diseño OC"],
         addons: [{ name: "Licencia comercial VTuber/Stream", priceArs: 35000 }]
+      },
+      {
+        title: "Ilustración completa con fondo (por etapas)",
+        description: "Pieza grande con escenario. Se paga etapa por etapa: cada una se abona antes de empezarla.",
+        priceArs: 150000,
+        priceUsd: 120,
+        paymentPlan: "MILESTONES",
+        milestones: [
+          { title: "Boceto y composición", description: "Pose, encuadre y paleta tentativa.", percent: 25, days: 4 },
+          { title: "Lineart", description: "Línea limpia del personaje y el fondo.", percent: 25, days: 5 },
+          { title: "Color base y luces", description: "Colores planos e iluminación general.", percent: 25, days: 5 },
+          { title: "Render final", description: "Detalles, efectos y entrega en alta.", percent: 25, days: 6 }
+        ],
+        turnaroundDays: 20,
+        maxSlots: 1,
+        revisionsIncluded: 4,
+        rating: "SFW",
+        tags: ["Fullbody", "Fondo", "Ilustración"],
+        addons: [{ name: "Segundo personaje", priceArs: 60000 }]
       }
     ],
     [

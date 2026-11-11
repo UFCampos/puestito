@@ -3,7 +3,12 @@
 import { Suspense, useEffect, useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { apiFetch, API_URL, resolveImageUrl } from "../../../lib/api";
+import { apiFetch, API_URL, fileTooLarge, resolveImageUrl } from "../../../lib/api";
+import { useAppConfig } from "../../../lib/useAppConfig";
+import { MilestoneActions, MilestoneTimeline, type OrderMilestoneView } from "../../../components/MilestonePanel";
+
+const IMAGE_EXT = /\.(png|jpe?g|webp)$/i;
+const DELIVERY_EXT = /\.(png|jpe?g|webp|zip|rar|psd)$/i;
 
 // Plan §4: pasos según la modalidad pactada
 function stepsFor(plan: string) {
@@ -36,6 +41,9 @@ const STATUS_BADGE: Record<string, { text: string; color: string }> = {
   CANCELLED: { text: "Pedido Cancelado", color: "bg-rose-50 text-rose-700 border-rose-200" },
   REJECTED: { text: "Solicitud Rechazada (sin cobro)", color: "bg-rose-50 text-rose-700 border-rose-200" },
   EXPIRED: { text: "Vencido • No se pagó a tiempo", color: "bg-slate-100 text-slate-600 border-slate-200" },
+  MILESTONE_WAITING_PAYMENT: { text: "Etapa aprobada • Esperando el pago de la siguiente", color: "bg-pink-50 text-pink-700 border-pink-200" },
+  MILESTONE_IN_PROGRESS: { text: "Etapa paga • En proceso", color: "bg-blue-50 text-blue-700 border-blue-200" },
+  MILESTONE_REVIEW: { text: "Etapa entregada • Esperando aprobación", color: "bg-purple-50 text-purple-700 border-purple-200" },
 };
 
 export default function OrderWorkspacePageWrapper() {
@@ -72,6 +80,25 @@ function OrderWorkspacePage() {
   const [finalWatermarkMode, setFinalWatermarkMode] = useState("AUTO_TEXT");
   const [finalFile, setFinalFile] = useState<File | null>(null);
   const [finalPreviewFile, setFinalPreviewFile] = useState<File | null>(null);
+  const [uploadError, setUploadError] = useState("");
+  const limits = useAppConfig().uploadLimitsMb;
+  // Un .zip / .rar / .psd no se puede previsualizar: hace falta una imagen aparte
+  const finalNeedsPreview = Boolean(finalFile && !IMAGE_EXT.test(finalFile.name));
+
+  function pickFile(file: File | undefined, maxMb: number, allowed: RegExp, allowedText: string): File | null {
+    setUploadError("");
+    if (!file) return null;
+    if (!allowed.test(file.name)) {
+      setUploadError(`"${file.name}" no es un formato admitido. Subí ${allowedText}.`);
+      return null;
+    }
+    const tooLarge = fileTooLarge(file, maxMb);
+    if (tooLarge) {
+      setUploadError(tooLarge);
+      return null;
+    }
+    return file;
+  }
 
   // Buyer review state
   const [rating, setRating] = useState(5);
@@ -292,7 +319,11 @@ function OrderWorkspacePage() {
   async function handleDeliverFinal(e: React.FormEvent) {
     e.preventDefault();
     if (!finalFile) {
-      alert("Seleccioná el archivo original HD para subir la entrega final.");
+      alert("Seleccioná el archivo final (imagen, .zip o .rar).");
+      return;
+    }
+    if (finalNeedsPreview && !finalPreviewFile) {
+      alert("Como el archivo final no es una imagen, subí también una imagen para la vista previa.");
       return;
     }
     setActionLoading(true);
@@ -371,6 +402,8 @@ function OrderWorkspacePage() {
   const badge = STATUS_BADGE[order.status] || { text: order.status, color: "bg-slate-100 text-slate-700" };
   const parsedRefs: string[] = order.referenceImages || [];
   const STATUS_STEPS = stepsFor(order.paymentPlanSnapshot);
+  const isMilestonePlan = order.paymentPlanSnapshot === "MILESTONES";
+  const orderMilestones: OrderMilestoneView[] = payload?.milestones || [];
   const currentStepIdx = STATUS_STEPS.findIndex((s) => s.key === order.status);
   const revisionsIncluded = order.serviceSnapshot?.revisionsIncluded ?? 0;
   const revisionsLeft = Math.max(0, revisionsIncluded - (order.revisionsUsed ?? 0));
@@ -432,14 +465,16 @@ function OrderWorkspacePage() {
           </p>
           <p className="mt-0.5 text-xs font-medium text-purple-600">
             {order.paymentPlanSnapshot === "FULL_100" && "Modalidad: 100% Anticipado"}
-            {order.paymentPlanSnapshot === "SPLIT_ON_SKETCH" && "Modalidad: 50% Seña + 50% al aprobar Boceto"}
-            {order.paymentPlanSnapshot === "SPLIT_ON_FINAL_PREVIEW" && "Modalidad: 50% Seña + 50% al aprobar Previa Final"}
+            {isMilestonePlan && `Modalidad: pago en ${orderMilestones.length} etapas`}
+            {order.paymentPlanSnapshot === "SPLIT_ON_SKETCH" && "Modalidad: 50% Seña + 50% al aprobar el boceto"}
+            {order.paymentPlanSnapshot === "SPLIT_ON_FINAL_PREVIEW" && "Modalidad: 50% Seña + 50% al aprobar la vista previa final"}
           </p>
         </div>
       </div>
 
       {/* Visual Stepper */}
-      <div className="mt-6 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
+      {isMilestonePlan && <MilestoneTimeline milestones={orderMilestones} />}
+      <div className={`mt-6 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8 ${isMilestonePlan ? "hidden" : ""}`}>
         {STATUS_STEPS.map((s, idx) => {
           const isCompleted = currentStepIdx >= 0 && (idx < currentStepIdx || order.status === "COMPLETED_HD_UNLOCKED");
           const isCurrent = order.status === s.key;
@@ -523,7 +558,9 @@ function OrderWorkspacePage() {
                 {isBuyer ? (
                   <div>
                     <p className="text-sm text-slate-700">
-                      ¡El artista aceptó tu comisión! Para comenzar a trabajar en el boceto, aboná el pago inicial mediante Mercado Pago Split.
+                      {isMilestonePlan
+                        ? `¡El artista aceptó tu comisión! Para que empiece la etapa 1 (“${orderMilestones[0]?.title ?? ""}”), aboná esa etapa con Mercado Pago.`
+                        : "¡El artista aceptó tu comisión! Para comenzar a trabajar en el boceto, aboná el pago inicial mediante Mercado Pago Split."}
                     </p>
                     <button
                       onClick={() => handleCheckout()}
@@ -564,15 +601,24 @@ function OrderWorkspacePage() {
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div>
                         <label className="mb-1 block text-xs font-semibold text-slate-700">
-                          Subir archivo de boceto (PNG/JPG/WebP)
+                          Subir archivo de boceto (PNG, JPG o WebP · máx. {limits.sketch} MB)
                         </label>
                         <input
                           type="file"
-                          accept="image/*"
+                          accept="image/png,image/jpeg,image/webp"
                           required
-                          onChange={(e) => setSketchFile(e.target.files?.[0] || null)}
+                          onChange={(e) => {
+                            const f = pickFile(e.target.files?.[0], limits.sketch, IMAGE_EXT, "una imagen PNG, JPG o WebP");
+                            if (!f) e.target.value = "";
+                            setSketchFile(f);
+                          }}
                           className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs"
                         />
+                        {uploadError && (
+                          <p role="alert" className="mt-1.5 text-xs font-semibold text-rose-600">
+                            {uploadError}
+                          </p>
+                        )}
                       </div>
                       <div>
                         <label className="mb-1 block text-xs font-semibold text-slate-700">
@@ -692,33 +738,60 @@ function OrderWorkspacePage() {
                 {isArtist ? (
                   <form onSubmit={handleDeliverFinal} className="space-y-4">
                     <p className="text-sm text-slate-700">
-                      Subí la obra final en alta resolución (HD). TuPuestito generará automáticamente una versión con marca de agua para vista previa y custodiará el original HD hasta que el 100% del pago esté completado.
+                      Subí la obra final en alta resolución. Si son varios archivos (versiones, capas, formatos), comprimilos en un <strong>.zip</strong> o <strong>.rar</strong>. El comprador ve solo una vista previa con marca de agua hasta que el 100% del pago esté acreditado.
                     </p>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div>
                         <label className="mb-1 block text-xs font-semibold text-slate-700">
-                          Archivo Final HD (PNG/JPG/WebP/ZIP/PSD, máx. 200 MB)
+                          Archivo final: imagen, .zip, .rar o .psd (máx. {limits.finalDelivery} MB)
                         </label>
                         <input
                           type="file"
-                          accept="image/*,.zip,.psd"
+                          accept=".png,.jpg,.jpeg,.webp,.zip,.rar,.psd"
                           required
-                          onChange={(e) => setFinalFile(e.target.files?.[0] || null)}
+                          onChange={(e) => {
+                            const f = pickFile(
+                              e.target.files?.[0],
+                              limits.finalDelivery,
+                              DELIVERY_EXT,
+                              "una imagen PNG, JPG o WebP, o un paquete .zip, .rar o .psd"
+                            );
+                            if (!f) e.target.value = "";
+                            setFinalFile(f);
+                            setFinalPreviewFile(null);
+                          }}
                           className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs"
                         />
-                        {finalFile && !finalFile.type.startsWith("image/") && (
-                          <div className="mt-2">
-                            <label className="mb-1 block text-xs font-semibold text-slate-700">
-                              Imagen para la vista previa (obligatoria si el original no es imagen)
+                        {finalFile && (
+                          <p className="mt-1 text-[11px] text-slate-500">
+                            {finalFile.name} · {(finalFile.size / 1024 / 1024).toFixed(1)} MB
+                          </p>
+                        )}
+                        {finalNeedsPreview && (
+                          <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50 p-2.5">
+                            <label className="mb-1 block text-xs font-semibold text-amber-900">
+                              Imagen para la vista previa (máx. {limits.finalPreview} MB)
                             </label>
+                            <p className="mb-1.5 text-[11px] text-amber-800">
+                              Un paquete no se puede mostrar: elegí la imagen que verá el comprador con marca de agua.
+                            </p>
                             <input
                               type="file"
                               accept="image/png,image/jpeg,image/webp"
                               required
-                              onChange={(e) => setFinalPreviewFile(e.target.files?.[0] || null)}
-                              className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs"
+                              onChange={(e) => {
+                                const f = pickFile(e.target.files?.[0], limits.finalPreview, IMAGE_EXT, "una imagen PNG, JPG o WebP");
+                                if (!f) e.target.value = "";
+                                setFinalPreviewFile(f);
+                              }}
+                              className="w-full rounded-xl border border-amber-200 bg-white px-3 py-2 text-xs"
                             />
                           </div>
+                        )}
+                        {uploadError && (
+                          <p role="alert" className="mt-1.5 text-xs font-semibold text-rose-600">
+                            {uploadError}
+                          </p>
                         )}
                       </div>
                       <div>
@@ -839,6 +912,25 @@ function OrderWorkspacePage() {
               </p>
             )}
 
+            {/* Plan por etapas */}
+            {isMilestonePlan && order.status.startsWith("MILESTONE_") && (
+              <MilestoneActions
+                orderId={orderId}
+                status={order.status}
+                milestones={orderMilestones}
+                currentMilestone={order.currentMilestone ?? 0}
+                isArtist={isArtist}
+                isBuyer={isBuyer}
+                revisionsLeft={revisionsLeft}
+                revisionsIncluded={revisionsIncluded}
+                limits={limits}
+                busy={actionLoading}
+                setBusy={setActionLoading}
+                reload={loadOrder}
+                onCheckout={() => handleCheckout()}
+              />
+            )}
+
             {/* 9. COMPLETED_HD_UNLOCKED */}
             {order.status === "COMPLETED_HD_UNLOCKED" && (
               <div className="mt-3 space-y-4">
@@ -858,7 +950,7 @@ function OrderWorkspacePage() {
                       disabled={actionLoading}
                       className="rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50"
                     >
-                      ⬇️ Descargar Original HD
+                      ⬇️ Descargar {/.(zip|rar)$/i.test(order.finalHdFilename ?? "") ? "entrega completa (" + order.finalHdFilename.split(".").pop().toUpperCase() + ")" : "Original HD"}
                     </button>
                   )}
                 </div>
@@ -1042,6 +1134,8 @@ function OrderWorkspacePage() {
                         {m.stage === "DEPOSIT_50" && "1er 50% (Seña Inicial)"}
                         {m.stage === "FINAL_50" && "2do 50% (Saldo Final)"}
                         {m.stage === "FULL_100" && "Pago Único 100%"}
+                        {m.stage === "MILESTONE" &&
+                          `Etapa ${m.milestoneIndex + 1}: ${orderMilestones[m.milestoneIndex]?.title ?? ""}`}
                       </span>
                       <span>${Number(m.grossAmount).toLocaleString("es-AR")} ARS</span>
                     </div>

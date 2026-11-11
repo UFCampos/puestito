@@ -17,10 +17,21 @@ import { newKey, storage } from "../services/storage.service.js";
 import { SLOT_STATUSES } from "../services/order.service.js";
 import { commissionOrders } from "../db/schema.js";
 import { config } from "../config.js";
+import { LIMITS, LIMITS_MB } from "../lib/limits.js";
 
 const ratingEnum = z.enum(["SFW", "SUGGESTIVE", "NSFW"]);
 const watermarkEnum = z.enum(["MANUAL", "AUTO_TEXT", "AUTO_AVATAR"]);
-const planEnum = z.enum(["FULL_100", "SPLIT_ON_SKETCH", "SPLIT_ON_FINAL_PREVIEW"]);
+const planEnum = z.enum(["FULL_100", "SPLIT_ON_SKETCH", "SPLIT_ON_FINAL_PREVIEW", "MILESTONES"]);
+
+export const MIN_MILESTONES = 2;
+export const MAX_MILESTONES = 8;
+
+const milestoneSchema = z.object({
+  title: z.string().trim().min(2, "Cada etapa necesita un nombre").max(80),
+  description: z.string().trim().max(500).default(""),
+  percent: z.number().int().min(1).max(99),
+  days: z.number().int().min(1).max(365)
+});
 
 const httpsUrl = z
   .string()
@@ -41,10 +52,44 @@ const serviceSchema = z.object({
   rating: ratingEnum,
   tags: z.array(z.string().max(40)).max(15).default([]),
   addons: z
-    .array(z.object({ name: z.string().trim().min(1).max(80), priceArs: z.number().int().min(0).max(100_000_000) }))
+    .array(
+      z.object({
+        /** Presente al editar un extra existente; ausente para extras nuevos */
+        id: z.string().uuid().optional(),
+        name: z.string().trim().min(1).max(80),
+        priceArs: z.number().int().min(0).max(100_000_000)
+      })
+    )
     .max(10)
     .default([])
+    .refine(
+      (list) => new Set(list.map((a) => a.name.toLowerCase())).size === list.length,
+      "Hay extras con el mismo nombre"
+    ),
+  /** Solo para paymentPlan = MILESTONES: etapas de pago definidas por el artista */
+  milestones: z.array(milestoneSchema).max(MAX_MILESTONES).default([])
+}).superRefine((data, ctx) => {
+  if (data.paymentPlan !== "MILESTONES") return;
+  if (data.milestones.length < MIN_MILESTONES) {
+    ctx.addIssue({ code: "custom", path: ["milestones"], message: `El pago por etapas necesita al menos ${MIN_MILESTONES} etapas` });
+    return;
+  }
+  const sum = data.milestones.reduce((acc, m) => acc + m.percent, 0);
+  if (sum !== 100) {
+    ctx.addIssue({ code: "custom", path: ["milestones"], message: `Los porcentajes de las etapas deben sumar 100% (hoy suman ${sum}%)` });
+  }
 });
+
+/** Campos del servicio derivados del plan: las etapas solo se guardan con MILESTONES */
+function planFields(body: z.infer<typeof serviceSchema>) {
+  if (body.paymentPlan !== "MILESTONES") return { paymentPlan: body.paymentPlan, milestones: [], turnaroundDays: body.turnaroundDays };
+  return {
+    paymentPlan: body.paymentPlan,
+    milestones: body.milestones,
+    // El plazo total es la suma de los plazos de cada etapa
+    turnaroundDays: Math.min(365, body.milestones.reduce((acc, m) => acc + m.days, 0))
+  };
+}
 
 /** Oculta la imagen de items +18 a quien no activó el filtro */
 function visibleImage<T extends { rating: string; imageUrl: string }>(item: T, showNsfw: boolean) {
@@ -313,10 +358,10 @@ export async function artistRoutes(fastify: FastifyInstance) {
   // ───────────────────────────────────────────────────────────
   fastify.post("/portfolio", async (request) => {
     const { user, profile } = await requireArtist(request);
-    const data = await request.file({ limits: { fileSize: 25 * 1024 * 1024 } });
+    const data = await request.file({ limits: { fileSize: LIMITS.portfolioBytes } });
     if (!data) throw new HttpError(400, "Archivo requerido");
-    const buffer = await data.toBuffer();
-    if (data.file.truncated) throw new HttpError(413, "La imagen supera los 25 MB");
+    const buffer = await data.toBuffer().catch(() => null);
+    if (!buffer || data.file.truncated) throw new HttpError(413, `La imagen supera los ${LIMITS_MB.portfolio} MB`);
     await WatermarkService.assertImage(buffer).catch((e: Error) => {
       throw new HttpError(400, e.message);
     });
@@ -388,6 +433,38 @@ export async function artistRoutes(fastify: FastifyInstance) {
   // ───────────────────────────────────────────────────────────
   // Servicios de comisión (con addons y tags)
   // ───────────────────────────────────────────────────────────
+  // GET /api/artists/me/services — todos los servicios del artista (incluye pausados), para el panel
+  fastify.get("/me/services", async (request) => {
+    const { profile } = await requireArtist(request);
+    const services = await db
+      .select()
+      .from(commissionServices)
+      .where(eq(commissionServices.artistId, profile.id))
+      .orderBy(desc(commissionServices.createdAt));
+    const ids = services.map((s) => s.id);
+    const extras = await servicesWithExtras(ids);
+    const orderCounts = ids.length
+      ? await db
+          .select({ serviceId: commissionOrders.serviceId, n: sql<number>`count(*)::int` })
+          .from(commissionOrders)
+          .where(inArray(commissionOrders.serviceId, ids))
+          .groupBy(commissionOrders.serviceId)
+      : [];
+    const totalOrders = new Map(orderCounts.map((r) => [r.serviceId, r.n]));
+    return {
+      services: services.map((s) => ({
+        ...s,
+        priceUsd: s.priceUsd === null ? null : Number(s.priceUsd),
+        tags: extras.tagMap.get(s.id) ?? [],
+        addons: extras.addons
+          .filter((a) => a.serviceId === s.id)
+          .map((a) => ({ id: a.id, name: a.name, priceArs: a.priceArs })),
+        slotsTaken: extras.activeCounts.get(s.id) ?? 0,
+        totalOrders: totalOrders.get(s.id) ?? 0
+      }))
+    };
+  });
+
   fastify.post("/services", async (request) => {
     const { profile } = await requireArtist(request);
     const body = parseBody(serviceSchema, request.body);
@@ -400,15 +477,16 @@ export async function artistRoutes(fastify: FastifyInstance) {
           description: body.description,
           priceArs: body.priceArs,
           priceUsd: body.priceUsd != null ? body.priceUsd.toFixed(2) : null,
-          paymentPlan: body.paymentPlan,
-          turnaroundDays: body.turnaroundDays,
+          ...planFields(body),
           maxSlots: body.maxSlots,
           revisionsIncluded: body.revisionsIncluded,
           rating: body.rating
         })
         .returning();
       if (body.addons.length) {
-        await tx.insert(commissionAddons).values(body.addons.map((a) => ({ ...a, serviceId: created!.id })));
+        await tx
+          .insert(commissionAddons)
+          .values(body.addons.map((a) => ({ name: a.name, priceArs: a.priceArs, serviceId: created!.id })));
       }
       await setServiceTags(tx, created!.id, body.tags);
       return created!;
@@ -428,8 +506,7 @@ export async function artistRoutes(fastify: FastifyInstance) {
           description: body.description,
           priceArs: body.priceArs,
           priceUsd: body.priceUsd != null ? body.priceUsd.toFixed(2) : null,
-          paymentPlan: body.paymentPlan,
-          turnaroundDays: body.turnaroundDays,
+          ...planFields(body),
           maxSlots: body.maxSlots,
           revisionsIncluded: body.revisionsIncluded,
           rating: body.rating
@@ -437,26 +514,69 @@ export async function artistRoutes(fastify: FastifyInstance) {
         .where(and(eq(commissionServices.id, serviceId), eq(commissionServices.artistId, profile.id)))
         .returning({ id: commissionServices.id });
       if (!updated) throw new HttpError(404, "Servicio no encontrado");
-      // Los pedidos guardan snapshot de los addons: desactivar los viejos no afecta pedidos existentes.
-      await tx.update(commissionAddons).set({ isActive: false }).where(eq(commissionAddons.serviceId, serviceId));
-      if (body.addons.length) {
-        await tx.insert(commissionAddons).values(body.addons.map((a) => ({ ...a, serviceId })));
+      // Extras: se actualizan los que traen id, se crean los nuevos y se desactivan los quitados.
+      // Los pedidos guardan un snapshot, así que editar extras no altera pedidos ya enviados.
+      const existing = await tx
+        .select({ id: commissionAddons.id })
+        .from(commissionAddons)
+        .where(and(eq(commissionAddons.serviceId, serviceId), eq(commissionAddons.isActive, true)));
+      const existingIds = new Set(existing.map((a) => a.id));
+      const keptIds = new Set<string>();
+      for (const addon of body.addons) {
+        if (addon.id && existingIds.has(addon.id)) {
+          keptIds.add(addon.id);
+          await tx
+            .update(commissionAddons)
+            .set({ name: addon.name, priceArs: addon.priceArs })
+            .where(eq(commissionAddons.id, addon.id));
+        } else {
+          await tx.insert(commissionAddons).values({ name: addon.name, priceArs: addon.priceArs, serviceId });
+        }
+      }
+      const removed = [...existingIds].filter((id) => !keptIds.has(id));
+      if (removed.length) {
+        await tx.update(commissionAddons).set({ isActive: false }).where(inArray(commissionAddons.id, removed));
       }
       await setServiceTags(tx, serviceId, body.tags);
     });
     return { ok: true };
   });
 
-  fastify.delete("/services/:serviceId", async (request) => {
+  // PATCH /api/artists/services/:serviceId/status — pausar o volver a publicar
+  fastify.patch("/services/:serviceId/status", async (request) => {
     const { profile } = await requireArtist(request);
     const { serviceId } = request.params as { serviceId: string };
+    const { isActive } = parseBody(z.object({ isActive: z.boolean() }), request.body);
     const [updated] = await db
       .update(commissionServices)
-      .set({ isActive: false })
+      .set({ isActive })
       .where(and(eq(commissionServices.id, serviceId), eq(commissionServices.artistId, profile.id)))
       .returning({ id: commissionServices.id });
     if (!updated) throw new HttpError(404, "Servicio no encontrado");
-    return { ok: true };
+    return { ok: true, isActive };
+  });
+
+  // DELETE — borra el servicio si nunca tuvo pedidos; si los tuvo, solo se puede pausar
+  fastify.delete("/services/:serviceId", async (request) => {
+    const { profile } = await requireArtist(request);
+    const { serviceId } = request.params as { serviceId: string };
+    const [service] = await db
+      .select({ id: commissionServices.id })
+      .from(commissionServices)
+      .where(and(eq(commissionServices.id, serviceId), eq(commissionServices.artistId, profile.id)))
+      .limit(1);
+    if (!service) throw new HttpError(404, "Servicio no encontrado");
+    const [used] = await db
+      .select({ id: commissionOrders.id })
+      .from(commissionOrders)
+      .where(eq(commissionOrders.serviceId, serviceId))
+      .limit(1);
+    if (used) {
+      await db.update(commissionServices).set({ isActive: false }).where(eq(commissionServices.id, serviceId));
+      return { ok: true, deleted: false, paused: true };
+    }
+    await db.delete(commissionServices).where(eq(commissionServices.id, serviceId));
+    return { ok: true, deleted: true, paused: false };
   });
 
   // ───────────────────────────────────────────────────────────

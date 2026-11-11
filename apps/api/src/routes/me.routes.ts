@@ -7,6 +7,7 @@ import { HttpError, parseBody, requireUser } from "../lib/http.js";
 import { storage, newKey } from "../services/storage.service.js";
 import { WatermarkService } from "../services/watermark.service.js";
 import { notifyDiscord } from "../services/notification.service.js";
+import { LIMITS, LIMITS_MB } from "../lib/limits.js";
 
 const DEFAULT_TOS =
   "1. La seña no es reembolsable una vez entregado el boceto.\n2. Prohibido usar mi arte para entrenar modelos de IA.\n3. Uso personal únicamente (consultar por licencia comercial).";
@@ -77,9 +78,10 @@ export async function meRoutes(fastify: FastifyInstance) {
     const kind = (request.query as { kind?: string }).kind;
     if (kind !== "avatar" && kind !== "banner") throw new HttpError(400, "kind debe ser avatar o banner");
 
-    const file = await request.file({ limits: { fileSize: 8 * 1024 * 1024 } });
+    const file = await request.file({ limits: { fileSize: LIMITS.avatarBytes } });
     if (!file) throw new HttpError(400, "Archivo requerido");
-    const buffer = await file.toBuffer();
+    const buffer = await file.toBuffer().catch(() => null);
+    if (!buffer || file.file.truncated) throw new HttpError(413, `La imagen supera los ${LIMITS_MB.avatar} MB`);
     await WatermarkService.assertImage(buffer).catch((e: Error) => {
       throw new HttpError(400, e.message);
     });
