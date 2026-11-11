@@ -1,95 +1,101 @@
-# 🎪 TuPuestito (MVP)
+# 🎨 TuPuestito — Marketplace de Comisiones para Artistas Argentinos
 
-**TuPuestito** es la plataforma e-commerce centralizada para artistas independientes argentinos, combinando lo mejor de **VGen** (gestión de comisiones digitales, pagos en etapas y protección anti-estafas) con el espíritu de stand virtual de **BOOTH.pm**, adaptado a la economía y medios de pago locales (Mercado Pago con pagos divididos).
+Plataforma de vidrieras y comisiones digitales con arquitectura **no-custodial**: cada pago va directo a la cuenta de Mercado Pago del artista y TuPuestito cobra su comisión con `marketplace_fee`.
 
----
-
-## 🌟 Funcionalidades Implementadas en el MVP (Sprints 1 al 6)
-
-1. **Catálogo & Descubrimiento:**
-   - Explorador visual de artistas con búsqueda en tiempo real por nombre, bio o fandom (ej. Vocaloid, Genshin).
-   - Insignia oficial de **"100% Humano Verificado"** (política de tolerancia cero a arte generado con IA).
-   - Filtros de contenido `SFW`, `SUGGESTIVE` y `NSFW`.
-
-2. **Perfil-Tienda del Artista (`/u/[username]`):**
-   - Banner y avatar personalizables, bio y enlaces directos a redes (X, Instagram, Pixiv, VGen).
-   - Pestaña de **Comisiones** con precios en pesos ARS, tiempo de entrega, cupos y revisiones.
-   - Pestaña de **Portfolio** de obras de arte.
-   - Pestaña de **Reseñas** de clientes con calificación de 1 a 5 estrellas.
-
-3. **Formulario de Solicitud de Comisión:**
-   - Explicación de la idea y detalles del personaje.
-   - Hasta **10 imágenes de referencia visual**.
-   - Enlace a tablero interactivo externo (sugiriendo **Excalidraw**, Miro o Google Drive).
-   - Checkbox contractual obligatorio aceptando los Términos de Servicio y la modalidad de pago del artista.
-
-4. **Sala del Pedido en Tiempo Real (`/orders/[orderId]`):**
-   - Hilo de mensajes y notificaciones de eventos del sistema.
-   - Línea de tiempo de estados (`REQUESTED`, `ACCEPTED_WAITING_DEPOSIT`, `IN_PROGRESS_SKETCH`, `SKETCH_REVIEW`, `WORKING_FINAL`, `COMPLETED_HD_UNLOCKED`).
-   - El artista puede subir bocetos y la entrega final directamente en la sala.
-
-5. **Protección con Marca de Agua Automática (`sharp`):**
-   - Procesamiento de imágenes optimizado a `WebP`.
-   - Marca de agua manual o automática (`AUTO_TEXT` o `AUTO_AVATAR`) repetida en diagonal para proteger las muestras de bocetos y previsualizaciones antes del pago.
-   - El archivo original en HD queda bloqueado y solo se destraba tras la aprobación del pago final.
-
-6. **Mercado Pago Split 1:1 (Sin custodia de fondos):**
-   - Descuento automático del 5% (`marketplace_fee`) para TuPuestito y 95% neto acreditado directo en la cuenta del artista.
-   - Modalidad configurable: **50% Seña inicial + 50% al aprobar boceto**, **50% Seña + 50% al aprobar vista previa final con marca de agua**, o **100% por adelantado**.
-   - Sandbox interactivo incorporado para desarrollo y pruebas.
+La especificación de referencia es [`docs/business-planning/plan_tecnico_mvp.md`](./docs/business-planning/plan_tecnico_mvp.md).
 
 ---
 
-## 🛠️ Stack Tecnológico
+## 🧱 Stack (Plan §1)
 
-- **Frontend:** Next.js 15 (App Router), React 19, Tailwind CSS, Lucide Icons.
-- **Backend:** Fastify 5, Drizzle ORM, Better-SQLite3 (cero configuración y ultra liviano para VPS económicos), Sharp, Fastify JWT, Fastify Cookie, Fastify Multipart.
-- **Monorepo:** PNPM Workspaces (`apps/web`, `apps/api`, `packages/shared`).
+| Capa | Tecnología |
+|---|---|
+| Monorepo | `pnpm` workspaces: `apps/web`, `apps/api`, `packages/shared` |
+| Backend | **Fastify** + TypeScript + **Drizzle ORM** + **PostgreSQL 16** |
+| Auth | **Better Auth**: email/contraseña, usuario, **Google** y **Discord** (sesiones en Postgres, cookie httpOnly) |
+| Archivos | **Cloudflare R2**: bucket público (portfolio/avatares) + bucket privado (todo lo del pedido, con URLs firmadas) |
+| Imágenes | `sharp`: marca de agua `MANUAL`, `AUTO_TEXT` o `AUTO_AVATAR` |
+| Pagos | **Mercado Pago**: OAuth del artista (PKCE, tokens cifrados AES-256-GCM) + Checkout Pro con `marketplace_fee` 5% + webhooks firmados |
+| Emails | **Resend** · avisos internos por **webhook de Discord** |
+| Deploy | Docker Compose + **Caddy** (HTTPS automático) en un VPS |
+
+## 🔄 Flujo del pedido (Plan §4)
+
+`REQUESTED → (REJECTED) | ACCEPTED_WAITING_DEPOSIT → (EXPIRED a las 72 hs) | IN_PROGRESS_SKETCH ⇄ SKETCH_REVIEW → [WAITING_PAYMENT_AFTER_SKETCH] → WORKING_FINAL → [FINAL_PREVIEW_REVIEW → WAITING_PAYMENT_BEFORE_HD] → COMPLETED_HD_UNLOCKED`
+
+- Los montos, extras y fees se calculan **solo en el servidor**; el pedido guarda un *snapshot* inmutable de ToS, plan de pago, servicio y extras.
+- El original HD vive en el bucket privado y **solo se entrega con una URL firmada de 5 minutos cuando el 100% figura `APPROVED`**.
+- Los pagos se confirman por webhook (firma `x-signature` verificada) o al volver del checkout, consultando siempre la API de Mercado Pago. El procesamiento es idempotente.
+- Los conceptos de cobro son neutros (`Encargo de ilustración digital #PST-1042 — @artista`), según el Plan §2.
 
 ---
 
-## 🚀 Cómo Ejecutar en Local
+## 🚀 Desarrollo local
 
-### 1. Clonar e instalar dependencias
+Requisitos: Node 22+, pnpm, Docker (para Postgres).
+
 ```bash
-git clone <tu-repo>
-cd puestito
 pnpm install
+pnpm db:up                                  # PostgreSQL 16 en Docker
+cp apps/api/.env.example apps/api/.env
+cp apps/web/.env.example apps/web/.env.local
+pnpm db:seed                                # migraciones + datos demo
+pnpm dev                                    # API :4000 + Web :3000
 ```
 
-### 2. Poblar datos de prueba (Seed)
+- Sin credenciales de R2, `STORAGE_DRIVER=local` guarda los archivos en `apps/api/storage/` con la misma semántica pública/privada.
+- `PAYMENTS_MODE=mock` usa un simulador de checkout (requiere sesión del comprador). **La API se niega a arrancar con `mock` en producción.**
+- Sin `RESEND_API_KEY`, los emails (verificación, recuperación de contraseña, avisos) se imprimen en la consola de la API.
+
+Cuentas demo (contraseña `tupuestito123`): `maomao` y `kaito_ink` (artistas), `uriel_fan` (comprador).
+
+### Tests end-to-end de la API
+
 ```bash
-cd apps/api
-pnpm tsx src/seed.ts
+pnpm test:e2e
 ```
-Esto creará:
-- **Artista Demo:** `maomao@tupuestito.com` (Contraseña: `123456`) — Perfil: `http://localhost:3000/u/maomao`
-- **Comprador Demo:** `comprador@tupuestito.com` (Contraseña: `123456`)
 
-### 3. Iniciar Backend y Frontend
-En dos terminales separadas (o con `pnpm dev`):
+Levanta un PostgreSQL embebido (PGlite), corre las migraciones y el seed, y recorre el flujo completo: auth, explorar, referencias firmadas, pedido 50/50, marca de agua, bloqueo del HD, pagos, reseñas y controles de permisos.
 
-**Terminal 1 (Backend Fastify - Puerto 4000):**
+### Migraciones
+
 ```bash
-cd apps/api
-pnpm dev
+pnpm --filter @tupuestito/api db:generate   # después de cambiar src/db/schema.ts
 ```
 
-**Terminal 2 (Frontend Next.js - Puerto 3000):**
-```bash
-cd apps/web
-pnpm dev
-```
-
-Abrí [http://localhost:3000](http://localhost:3000) en tu navegador.
+La API aplica las migraciones pendientes al iniciar.
 
 ---
 
-## 📚 Documentación de Negocio y Planificación
-Todos los planes estratégicos y financieros se encuentran en [`docs/business-planning/`](./docs/business-planning):
-- [Modelo de Negocio y Rentabilidad](./docs/business-planning/modelo_de_negocio.md)
-- [Plan Técnico del MVP](./docs/business-planning/plan_tecnico_mvp.md)
-- [Encuesta para Compradores y Artistas](./docs/business-planning/encuesta_compradores.md)
-- [Estrategia de Pagos Mercado Pago y AstroPay](./docs/business-planning/pagos_mercadopago_astropay.md)
-- [Guía de Despliegue en VPS](./docs/VPS_DEPLOYMENT_GUIDE.md)
+## 🌐 Producción (VPS + Docker Compose + Caddy)
 
+1. **DNS en Cloudflare**: `tupuestito.com.ar` y `api.tupuestito.com.ar` apuntando al VPS (SSL/TLS en *Full (strict)*).
+2. **Cloudflare R2**: crear `tupuestito-public` (con dominio público, ej. `cdn.tupuestito.com.ar`) y `tupuestito-private` (sin acceso público). En **el bucket privado** configurar CORS para las subidas directas del navegador:
+   ```json
+   [{ "AllowedOrigins": ["https://tupuestito.com.ar"], "AllowedMethods": ["PUT", "GET"], "AllowedHeaders": ["content-type"], "MaxAgeSeconds": 3600 }]
+   ```
+3. **Mercado Pago** (developers.mercadopago.com → app tipo *Marketplace*):
+   - Redirect URI de OAuth: `https://api.tupuestito.com.ar/api/payments/mp/callback`
+   - Webhooks → evento *Pagos* → `https://api.tupuestito.com.ar/api/payments/webhook`, y copiar la clave secreta en `MP_WEBHOOK_SECRET`.
+4. **Google / Discord OAuth**: callback `https://api.tupuestito.com.ar/api/auth/callback/{google|discord}`.
+5. **Resend**: verificar el dominio del remitente.
+6. En el VPS:
+   ```bash
+   cp .env.production.example .env.production   # completar todos los secretos
+   pnpm prod:up                                 # docker compose -f docker-compose.prod.yml ... up -d --build
+   ```
+
+> ⚠️ Guardá `ENCRYPTION_KEY` en un lugar seguro: sin ella no se pueden descifrar los tokens de Mercado Pago y los artistas tienen que volver a vincular su cuenta.
+
+### Administración
+
+- La insignia **"100% Humano Verificado"** la otorga un usuario `ADMIN` (`POST /api/artists/:artistId/verify-human`). Para crear el primer admin: `UPDATE users SET role='ADMIN' WHERE username='...'`.
+- Drizzle Studio: `pnpm db:studio`.
+
+---
+
+## 📂 Documentación de negocio (`/docs`)
+
+- [`modelo_financiero.xlsx`](./docs/modelo_financiero.xlsx) · [`modelo_de_negocio.md`](./docs/business-planning/modelo_de_negocio.md) · [`pagos_mercadopago_astropay.md`](./docs/business-planning/pagos_mercadopago_astropay.md) · [`encuesta_compradores.md`](./docs/business-planning/encuesta_compradores.md) · [`plan_tecnico_mvp.md`](./docs/business-planning/plan_tecnico_mvp.md)
+
+AstroPay (USD) figura en el plan como *sandbox / futuro*: en el panel aparece como "Próximamente".

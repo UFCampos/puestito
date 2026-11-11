@@ -1,84 +1,107 @@
 import sharp from "sharp";
-import path from "node:path";
-import fs from "node:fs/promises";
-import crypto from "node:crypto";
+
+export type WatermarkMode = "MANUAL" | "AUTO_TEXT" | "AUTO_AVATAR";
 
 export interface WatermarkOptions {
-  mode: "MANUAL" | "AUTO_TEXT" | "AUTO_AVATAR";
-  customText?: string;
-  avatarUrl?: string;
+  mode: WatermarkMode;
+  /** @username del artista (sin @) */
+  username: string;
+  /** Texto personalizado opcional (watermark_custom_text) */
+  customText?: string | null;
+  /** Imagen del avatar (para AUTO_AVATAR) */
+  avatar?: Buffer | null;
+  /** Ancho máximo del resultado (vista previa en baja resolución) */
+  maxWidth?: number;
+}
+
+function escapeXml(s: string): string {
+  return s.replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&apos;" })[c]!);
 }
 
 export class WatermarkService {
-  /**
-   * Procesa una imagen para portfolio o entrega de boceto/preview
-   * Genera un WebP optimizado y, si corresponde, le estampa marca de agua
-   */
-  static async processImage(
-    inputBuffer: Buffer,
-    options: WatermarkOptions
-  ): Promise<Buffer> {
-    const image = sharp(inputBuffer);
-    const metadata = await image.metadata();
-    const width = metadata.width || 1200;
-    const height = metadata.height || 1200;
-
-    if (options.mode === "MANUAL") {
-      // Solo optimiza a WebP
-      return await image
-        .resize({ width: Math.min(width, 1600), withoutEnlargement: true })
-        .webp({ quality: 85 })
-        .toBuffer();
+  /** Valida que el buffer sea una imagen que sharp pueda leer */
+  static async assertImage(input: Buffer): Promise<void> {
+    const meta = await sharp(input).metadata().catch(() => null);
+    if (!meta?.width || !meta.height || !["png", "jpeg", "webp", "gif", "avif", "tiff"].includes(meta.format ?? "")) {
+      throw new Error("El archivo no es una imagen válida (PNG, JPG o WebP)");
     }
+  }
 
-    // Modo AUTO_TEXT o AUTO_AVATAR: Crear overlay SVG repetido en diagonal
-    const text = options.customText || "TuPuestito • MUESTRA NO AUTORIZADA";
-    const patternWidth = 400;
-    const patternHeight = 150;
-
-    const svgOverlay = `
-      <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
-        <defs>
-          <pattern id="wm-pattern" width="${patternWidth}" height="${patternHeight}" patternUnits="userSpaceOnUse" patternTransform="rotate(-30)">
-            <text x="20" y="80" 
-                  font-family="sans-serif" 
-                  font-size="20" 
-                  font-weight="bold" 
-                  fill="white" 
-                  fill-opacity="0.28" 
-                  stroke="black" 
-                  stroke-width="0.5" 
-                  stroke-opacity="0.3">
-              ${text}
-            </text>
-          </pattern>
-        </defs>
-        <rect width="100%" height="100%" fill="url(#wm-pattern)" />
-      </svg>
-    `;
-
-    return await image
-      .resize({ width: Math.min(width, 1600), withoutEnlargement: true })
-      .composite([
-        {
-          input: Buffer.from(svgOverlay),
-          top: 0,
-          left: 0
-        }
-      ])
+  /** Solo optimiza a WebP (referencias, portfolio en modo MANUAL, avatares) */
+  static async optimize(input: Buffer, maxWidth = 1600): Promise<Buffer> {
+    return sharp(input, { failOn: "error" })
+      .rotate()
+      .resize({ width: maxWidth, height: maxWidth, fit: "inside", withoutEnlargement: true })
       .webp({ quality: 85 })
       .toBuffer();
   }
 
   /**
-   * Guarda un buffer procesado en la carpeta de uploads local y retorna la URL pública
+   * Plan §3.A — Marca de agua:
+   *  - MANUAL: solo convierte a WebP optimizado.
+   *  - AUTO_TEXT: patrón SVG en diagonal (30°) repetido con `@username • MUESTRA TuPuestito - NO USAR`.
+   *  - AUTO_AVATAR: sello con el avatar del artista + @username, en mosaico.
    */
-  static async saveUpload(buffer: Buffer, extension = "webp"): Promise<string> {
-    const filename = `${crypto.randomUUID()}.${extension}`;
-    const uploadDir = path.resolve(process.cwd(), "uploads");
-    await fs.mkdir(uploadDir, { recursive: true });
-    await fs.writeFile(path.join(uploadDir, filename), buffer);
-    return `/uploads/${filename}`;
+  static async apply(input: Buffer, options: WatermarkOptions): Promise<Buffer> {
+    const maxWidth = options.maxWidth ?? 1600;
+
+    // 1. Redimensionar primero: el overlay se construye con las dimensiones finales.
+    const base = await sharp(input, { failOn: "error" })
+      .rotate()
+      .resize({ width: maxWidth, height: maxWidth, fit: "inside", withoutEnlargement: true })
+      .toBuffer({ resolveWithObject: true });
+
+    if (options.mode === "MANUAL") {
+      return sharp(base.data).webp({ quality: 85 }).toBuffer();
+    }
+
+    const { width, height } = base.info;
+    const label = escapeXml(
+      (options.customText?.trim() || `@${options.username} • MUESTRA TuPuestito - NO USAR`).slice(0, 80)
+    );
+    const fontSize = Math.max(14, Math.round(Math.min(width, height) / 32));
+    const tileW = Math.round(fontSize * Math.max(label.length * 0.62, 12));
+    const tileH = Math.round(fontSize * (options.mode === "AUTO_AVATAR" ? 7 : 5));
+
+    let stamp: string;
+    if (options.mode === "AUTO_AVATAR" && options.avatar) {
+      const size = fontSize * 3;
+      const circle = Buffer.from(
+        `<svg width="${size}" height="${size}"><circle cx="${size / 2}" cy="${size / 2}" r="${size / 2}" fill="#fff"/></svg>`
+      );
+      const avatarPng = await sharp(options.avatar)
+        .resize(size, size, { fit: "cover" })
+        .composite([{ input: circle, blend: "dest-in" }])
+        .png()
+        .toBuffer()
+        .catch(() => null);
+      stamp = avatarPng
+        ? `<image x="0" y="0" width="${size}" height="${size}" opacity="0.5" href="data:image/png;base64,${avatarPng.toString("base64")}"/>
+           <text x="0" y="${size + fontSize * 1.4}" font-family="sans-serif" font-size="${fontSize}" font-weight="700"
+             fill="#fff" fill-opacity="0.45" stroke="#000" stroke-opacity="0.35" stroke-width="${fontSize / 16}">${label}</text>`
+        : "";
+    } else {
+      stamp = "";
+    }
+
+    if (!stamp) {
+      stamp = `<text x="0" y="${fontSize * 2}" font-family="sans-serif" font-size="${fontSize}" font-weight="700"
+        fill="#fff" fill-opacity="0.42" stroke="#000" stroke-opacity="0.35" stroke-width="${fontSize / 16}">${label}</text>`;
+    }
+
+    // El patrón cubre el doble del lienzo y se rota 30° para que no se pueda recortar.
+    const overlay = Buffer.from(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <pattern id="wm" width="${tileW}" height="${tileH}" patternUnits="userSpaceOnUse" patternTransform="rotate(-30)">
+          ${stamp}
+        </pattern>
+      </defs>
+      <rect x="0" y="0" width="${width}" height="${height}" fill="url(#wm)"/>
+    </svg>`);
+
+    return sharp(base.data)
+      .composite([{ input: overlay, top: 0, left: 0 }])
+      .webp({ quality: 80 })
+      .toBuffer();
   }
 }
-

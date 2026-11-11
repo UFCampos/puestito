@@ -1,136 +1,244 @@
 "use client";
 
-import { useState } from "react";
+import React, { useState } from "react";
 import Link from "next/link";
-import { fetchApi } from "../../lib/api";
+import { useRouter } from "next/navigation";
+import { apiFetch, authClient } from "@/lib/api";
+import { SocialLogin } from "@/components/SocialLogin";
 
 export default function RegisterPage() {
+  const [displayName, setDisplayName] = useState("");
+  const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [username, setUsername] = useState("");
-  const [displayName, setDisplayName] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [isArtist, setIsArtist] = useState(true);
+  const [acceptedAntiAi, setAcceptedAntiAi] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [verifyPending, setVerifyPending] = useState(false);
+  const router = useRouter();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true);
+    if (isArtist && !acceptedAntiAi) {
+      setError("Para abrir un puestito de artista debés aceptar la declaración de Arte 100% Humano.");
+      return;
+    }
     setError("");
-
+    setLoading(true);
     try {
-      await fetchApi("/auth/register", {
-        method: "POST",
-        body: JSON.stringify({ email, password, username, displayName, isArtist })
+      const { data, error } = await authClient.signUp.email({
+        name: displayName.trim(),
+        username,
+        email: email.trim().toLowerCase(),
+        password
       });
-      window.location.href = isArtist ? "/dashboard" : "/";
+      if (error) {
+        const code = (error.code || "").toUpperCase();
+        throw new Error(
+          code.includes("USERNAME")
+            ? "Ese nombre de usuario ya está en uso o no es válido (3-30 caracteres: a-z, 0-9, _)."
+            : code.includes("EXISTS") || code.includes("EMAIL")
+            ? "Ya existe una cuenta con ese email."
+            : code.includes("PASSWORD")
+            ? "La contraseña debe tener entre 8 y 128 caracteres."
+            : error.message || "No se pudo crear la cuenta"
+        );
+      }
+      if (!data?.token) {
+        // Verificación de email obligatoria: todavía no hay sesión
+        setError("");
+        setVerifyPending(true);
+        return;
+      }
+      if (isArtist) {
+        await apiFetch("/api/me/artist-profile", {
+          method: "POST",
+          body: JSON.stringify({ acceptHumanArtPledge: true })
+        });
+        router.push("/dashboard");
+      } else {
+        router.push("/");
+      }
+      router.refresh();
     } catch (err: any) {
-      setError(err.message || "Error al registrar la cuenta");
+      setError(err.message || "Error al registrarse");
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="max-w-md mx-auto px-4 py-16">
-      <div className="bg-white p-8 rounded-2xl border border-neutral-200 shadow-sm space-y-6">
-        <div className="text-center">
-          <span className="text-3xl">🎪</span>
-          <h1 className="text-2xl font-black text-neutral-900 mt-2">Crear cuenta en TuPuestito</h1>
-          <p className="text-xs text-neutral-500 mt-1">El espacio para el arte independiente en Argentina</p>
-        </div>
-
-        {error && (
-          <div className="p-3 rounded-xl bg-red-50 text-red-700 text-xs font-medium border border-red-200">
-            {error}
-          </div>
-        )}
+    <main className="mx-auto max-w-lg px-4 py-10">
+      <div className="rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
+        <h1 className="text-2xl font-extrabold text-slate-900">Crear cuenta en TuPuestito</h1>
+        <p className="mt-1 text-sm text-slate-500">
+          Abrí tu tienda/portfolio gratis en menos de 5 minutos o registrate para pedir comisiones.
+        </p>
 
         {/* Selector de Rol */}
-        <div className="grid grid-cols-2 gap-2 p-1 bg-neutral-100 rounded-xl text-xs font-bold text-center">
+        <div className="mt-5 grid grid-cols-2 gap-3">
           <button
             type="button"
             onClick={() => setIsArtist(true)}
-            className={`py-2 rounded-lg transition ${isArtist ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-500"}`}
+            className={`rounded-xl border p-3 text-left transition ${
+              isArtist
+                ? "border-purple-600 bg-purple-50 ring-2 ring-purple-600/20"
+                : "border-slate-200 hover:bg-slate-50"
+            }`}
           >
-            🎨 Soy Artista
+            <p className="text-sm font-bold text-slate-900">🎨 Soy Artista</p>
+            <p className="text-xs text-slate-500">Quiero mostrar mi portfolio y vender comisiones</p>
           </button>
           <button
             type="button"
             onClick={() => setIsArtist(false)}
-            className={`py-2 rounded-lg transition ${!isArtist ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-500"}`}
+            className={`rounded-xl border p-3 text-left transition ${
+              !isArtist
+                ? "border-purple-600 bg-purple-50 ring-2 ring-purple-600/20"
+                : "border-slate-200 hover:bg-slate-50"
+            }`}
           >
-            🛍️ Soy Comprador
+            <p className="text-sm font-bold text-slate-900">🛍️ Soy Comprador</p>
+            <p className="text-xs text-slate-500">Quiero encargar arte y seguir mis pedidos</p>
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4 text-xs">
+        <SocialLogin next={isArtist ? "/dashboard" : "/"} />
+
+        {verifyPending && (
+          <div className="mt-4 rounded-xl bg-emerald-50 p-3 text-xs font-semibold text-emerald-800">
+            📧 Te enviamos un email para confirmar tu cuenta. Después de confirmarlo podés ingresar
+            {isArtist ? " y abrir tu puestito desde el panel." : "."}
+          </div>
+        )}
+
+        {error && (
+          <div className="mt-4 rounded-xl bg-rose-50 p-3 text-xs font-semibold text-rose-700">
+            ⚠️ {error}
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} className="mt-6 space-y-4">
           <div>
-            <label className="block font-bold text-neutral-700 mb-1">Nombre Público (Display Name)</label>
+            <label htmlFor="signup-name" className="block text-xs font-bold text-slate-700">
+              Nombre Visible / Artístico
+            </label>
             <input
-              required
+              id="signup-name"
+              name="name"
               type="text"
-              placeholder="Ej: Sakura Art ✨"
+              autoComplete="name"
+              required
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
-              className="w-full p-3 rounded-xl border border-neutral-300 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+              placeholder="Ej: MaoMao Atelier"
+              className="mt-1 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-purple-600 focus:outline-none"
             />
           </div>
 
           <div>
-            <label className="block font-bold text-neutral-700 mb-1">Nombre de Usuario (@username)</label>
+            <label htmlFor="signup-username" className="block text-xs font-bold text-slate-700">
+              Nombre de Usuario (tu URL única: tupuestito.com.ar/u/{username || "usuario"})
+            </label>
             <input
-              required
+              id="signup-username"
+              name="username"
               type="text"
-              placeholder="sakura_art"
+              autoComplete="username"
+              spellCheck={false}
+              autoCapitalize="none"
+              autoCorrect="off"
+              required
               value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              className="w-full p-3 rounded-xl border border-neutral-300 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+              onChange={(e) =>
+                setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))
+              }
+              placeholder="maomao"
+              className="mt-1 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-purple-600 focus:outline-none"
             />
-            <p className="text-[10px] text-neutral-400 mt-1">Tu URL será: tupuestito.com.ar/u/{username || "tu_nombre"}</p>
           </div>
 
           <div>
-            <label className="block font-bold text-neutral-700 mb-1">Email</label>
+            <label htmlFor="signup-email" className="block text-xs font-bold text-slate-700">
+              Correo Electrónico
+            </label>
             <input
-              required
+              id="signup-email"
+              name="email"
               type="email"
-              placeholder="tu@email.com"
+              autoComplete="email"
+              spellCheck={false}
+              required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="w-full p-3 rounded-xl border border-neutral-300 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+              placeholder="tu@email.com"
+              className="mt-1 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-purple-600 focus:outline-none"
             />
           </div>
 
           <div>
-            <label className="block font-bold text-neutral-700 mb-1">Contraseña</label>
+            <div className="flex items-center justify-between">
+              <label htmlFor="new-password" className="block text-xs font-bold text-slate-700">
+                Contraseña (mínimo 8 caracteres)
+              </label>
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="text-xs font-semibold text-purple-700 hover:underline"
+              >
+                {showPassword ? "Ocultar" : "Mostrar contraseña"}
+              </button>
+            </div>
             <input
+              id="new-password"
+              name="new-password"
+              type={showPassword ? "text" : "password"}
+              autoComplete="new-password"
+              minLength={8}
               required
-              type="password"
-              placeholder="Mínimo 6 caracteres"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full p-3 rounded-xl border border-neutral-300 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+              className="mt-1 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-purple-600 focus:outline-none"
             />
           </div>
+
+          {isArtist && (
+            <label className="flex cursor-pointer items-start gap-2.5 rounded-xl border border-emerald-200 bg-emerald-50/70 p-3 text-xs text-emerald-950">
+              <input
+                type="checkbox"
+                checked={acceptedAntiAi}
+                onChange={(e) => setAcceptedAntiAi(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-emerald-400 text-emerald-600"
+              />
+              <span>
+                <strong>Compromiso 100% Arte Humano:</strong> Declaro que todas las obras que suba a mi portfolio y entregue en comisiones son creadas por mí sin utilizar IA generativa.
+              </span>
+            </label>
+          )}
 
           <button
             type="submit"
             disabled={loading}
-            className="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3.5 rounded-xl shadow transition text-sm disabled:opacity-50"
+            className="w-full rounded-xl bg-purple-600 py-3 text-sm font-bold text-white shadow-sm transition hover:bg-purple-700 disabled:opacity-50"
           >
-            {loading ? "Registrando..." : isArtist ? "Abrir mi Puestito 🎪" : "Crear Cuenta de Comprador"}
+            {loading
+              ? "Creando cuenta..."
+              : isArtist
+              ? "Crear mi Puestito de Artista Gratis"
+              : "Crear Cuenta de Comprador"}
           </button>
         </form>
 
-        <div className="text-center text-xs text-neutral-500 pt-2 border-t border-neutral-100">
+        <p className="mt-6 text-center text-xs text-slate-500">
           ¿Ya tenés cuenta?{" "}
-          <Link href="/login" className="text-purple-600 font-bold hover:underline">
+          <Link href="/login" className="font-bold text-purple-700 hover:underline">
             Iniciar sesión
           </Link>
-        </div>
+        </p>
       </div>
-    </div>
+    </main>
   );
 }
 

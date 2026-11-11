@@ -18,7 +18,9 @@ export type WatermarkMode = z.infer<typeof WatermarkModeSchema>;
 
 export const CommissionOrderStatusSchema = z.enum([
   "REQUESTED",
+  "REJECTED",
   "ACCEPTED_WAITING_DEPOSIT",
+  "EXPIRED",
   "IN_PROGRESS_SKETCH",
   "SKETCH_REVIEW",
   "WAITING_PAYMENT_AFTER_SKETCH",
@@ -30,3 +32,6 @@ export const CommissionOrderStatusSchema = z.enum([
 ]);
 export type CommissionOrderStatus = z.infer<typeof CommissionOrderStatusSchema>;
 
+
+export const MilestoneStageSchema = z.enum(["FULL_100", "DEPOSIT_50", "FINAL_50"]);
+export type MilestoneStage = z.infer<typeof MilestoneStageSchema>;

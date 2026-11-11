@@ -1,197 +1,385 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import Link from "next/link";
-import { fetchApi } from "../lib/api";
-import { Search, Sparkles, ShieldCheck, HeartHandshake } from "lucide-react";
+import { apiFetch, resolveImageUrl } from "@/lib/api";
+
+interface CommissionServiceItem {
+  id: string;
+  title: string;
+  description: string;
+  priceArs: number;
+  priceUsd?: number | null;
+  paymentPlan: "FULL_100" | "SPLIT_ON_SKETCH" | "SPLIT_ON_FINAL_PREVIEW";
+  turnaroundDays: number;
+  maxSlots: number;
+  revisionsIncluded: number;
+  rating: "SFW" | "SUGGESTIVE" | "NSFW";
+  tags?: string[];
+}
+
+interface PortfolioItem {
+  id: string;
+  title: string;
+  imageUrl: string | null;
+  hidden?: boolean;
+  rating: "SFW" | "SUGGESTIVE" | "NSFW";
+  tags?: string[];
+}
+
+interface ArtistExploreCard {
+  id: string;
+  userId: string;
+  username: string;
+  displayName: string;
+  avatarUrl?: string;
+  bio?: string;
+  bannerUrl?: string;
+  commissionStatus: "OPEN" | "WAITLIST" | "CLOSED";
+  isVerifiedHuman: boolean;
+  avgRating?: number | null;
+  reviewCount: number;
+  services: CommissionServiceItem[];
+  portfolio: PortfolioItem[];
+}
+
+const POPULAR_TAGS = ["Todos", "Anime", "Vocaloid", "VTuber", "Genshin", "Chibi", "Emotes", "OC", "Full Color"];
 
 export default function HomePage() {
-  const [artists, setArtists] = useState<any[]>([]);
+  const [artists, setArtists] = useState<ArtistExploreCard[]>([]);
   const [loading, setLoading] = useState(true);
-  const [search, setSearch] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedTag, setSelectedTag] = useState("Todos");
+  const [statusFilter, setStatusFilter] = useState("ALL");
+  const [showSuggestive, setShowSuggestive] = useState(false);
+  const [maxPrice, setMaxPrice] = useState<string>("");
+
+  const fetchArtists = async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (searchQuery.trim()) params.set("q", searchQuery.trim());
+      if (selectedTag !== "Todos") params.set("tag", selectedTag);
+      if (statusFilter !== "ALL") params.set("status", statusFilter);
+      if (!showSuggestive) params.set("rating", "SFW_ONLY");
+      if (maxPrice) params.set("maxPrice", maxPrice);
+
+      const data = await apiFetch<{ artists: ArtistExploreCard[] }>(
+        `/api/artists/explore?${params.toString()}`
+      );
+      setArtists(data.artists || []);
+    } catch (err) {
+      console.error("Error cargando artistas:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    fetchApi("/artists/explore")
-      .then((data) => setArtists(data.artists || []))
-      .catch((err) => console.error(err))
-      .finally(() => setLoading(false));
-  }, []);
+    fetchArtists();
+  }, [selectedTag, statusFilter, showSuggestive, maxPrice]);
 
-  const filteredArtists = artists.filter((a) => {
-    const q = search.toLowerCase();
-    return (
-      a.displayName.toLowerCase().includes(q) ||
-      a.username.toLowerCase().includes(q) ||
-      a.bio?.toLowerCase().includes(q)
-    );
-  });
+  const handleSearchSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    fetchArtists();
+  };
 
   return (
-    <div className="space-y-12 pb-16">
-      {/* Hero Section */}
-      <section className="bg-gradient-to-b from-purple-50 via-white to-neutral-50 border-b border-neutral-200 py-16 px-4">
-        <div className="max-w-4xl mx-auto text-center space-y-6">
-          <div className="inline-flex items-center gap-2 bg-purple-100 text-purple-700 text-xs font-bold px-3 py-1 rounded-full uppercase tracking-wider">
-            <Sparkles className="w-3.5 h-3.5" /> Descubrí el talento independiente de Argentina
+    <main className="mx-auto max-w-6xl px-4 py-8">
+      {/* Hero Banner */}
+      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-r from-purple-800 via-purple-700 to-indigo-800 p-8 text-white shadow-xl sm:p-12">
+        <div className="relative z-10 max-w-2xl">
+          <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-white/15 px-3.5 py-1 text-xs font-semibold backdrop-blur-sm">
+            <span>🇦🇷 Comunidad de Artistas Argentinos</span>
+            <span>•</span>
+            <span>🛡️ 100% Libre de IA</span>
           </div>
-          <h1 className="text-4xl md:text-5xl font-black text-neutral-900 tracking-tight leading-tight">
-            Comisioná arte a tus artistas favoritos en un solo lugar 🎪
+          <h1 className="text-3xl font-extrabold tracking-tight sm:text-5xl">
+            Tu feria virtual de comisiones y arte independiente
           </h1>
-          <p className="text-lg text-neutral-600 max-w-2xl mx-auto">
-            El stand de feria virtual tipo Booth y VGen adaptado a Argentina: pagá en pesos vía Mercado Pago en 2 etapas, sin miedo a estafas y con arte 100% humano.
+          <p className="mt-3 text-base text-purple-100 sm:text-lg">
+            Descubrí ilustradores locales por fandom o estilo, encargá tu comisión con precios claros en Pesos/USD y aboná en 2 etapas seguras directo al artista.
           </p>
 
-          {/* Barra de búsqueda */}
-          <div className="max-w-xl mx-auto relative flex items-center">
-            <Search className="w-5 h-5 text-neutral-400 absolute left-4 pointer-events-none" />
+          <form onSubmit={handleSearchSubmit} className="mt-6 flex flex-col gap-2 sm:flex-row">
             <input
-              type="text"
-              placeholder="Buscar por artista, personaje, fandom (ej: Vocaloid, Genshin)..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="w-full pl-11 pr-4 py-3.5 rounded-xl border border-neutral-300 bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent transition"
+              type="search"
+              enterKeyHint="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Buscar por artista, fandom (Vocaloid, Genshin), VTuber, Chibi..."
+              className="flex-1 rounded-xl border-0 bg-white px-4 py-3 text-sm text-slate-900 placeholder-slate-400 shadow-sm focus:outline-none focus:ring-2 focus:ring-purple-300"
             />
-          </div>
+            <button
+              type="submit"
+              className="rounded-xl bg-amber-400 px-6 py-3 text-sm font-bold text-slate-950 shadow-sm transition hover:bg-amber-300"
+            >
+              🔍 Buscar
+            </button>
+          </form>
         </div>
       </section>
 
-      {/* Características principales */}
-      <section className="max-w-6xl mx-auto px-4 grid grid-cols-1 md:grid-cols-3 gap-6">
-        <div className="bg-white p-6 rounded-2xl border border-neutral-200 shadow-sm flex items-start gap-4">
-          <div className="bg-purple-100 text-purple-600 p-3 rounded-xl">
-            <ShieldCheck className="w-6 h-6" />
-          </div>
-          <div>
-            <h3 className="font-bold text-neutral-900 mb-1">Pago protegido en 2 etapas</h3>
-            <p className="text-sm text-neutral-500">
-              Aboná 50% de seña para que el artista comience y el 50% final recién al aprobar el boceto o la vista previa terminada.
-            </p>
-          </div>
-        </div>
-
-        <div className="bg-white p-6 rounded-2xl border border-neutral-200 shadow-sm flex items-start gap-4">
-          <div className="bg-pink-100 text-pink-600 p-3 rounded-xl">
-            <HeartHandshake className="w-6 h-6" />
-          </div>
-          <div>
-            <h3 className="font-bold text-neutral-900 mb-1">Mercado Pago Split Oficial</h3>
-            <p className="text-sm text-neutral-500">
-              Tu dinero se acredita directo en la cuenta del artista sin intermediaciones sospechosas ni retenciones extrañas.
-            </p>
-          </div>
-        </div>
-
-        <div className="bg-white p-6 rounded-2xl border border-neutral-200 shadow-sm flex items-start gap-4">
-          <div className="bg-amber-100 text-amber-600 p-3 rounded-xl">
-            <Sparkles className="w-6 h-6" />
-          </div>
-          <div>
-            <h3 className="font-bold text-neutral-900 mb-1">Comunidad 100% Humana</h3>
-            <p className="text-sm text-neutral-500">
-              Tolerancia cero a arte generado con IA. Garantizamos que cada trazo fue dibujado por manos de ilustradores humanos.
-            </p>
-          </div>
-        </div>
-      </section>
-
-      {/* Grilla de Artistas */}
-      <section className="max-w-6xl mx-auto px-4 space-y-6">
-        <div className="flex items-center justify-between">
-          <h2 className="text-2xl font-black text-neutral-900 tracking-tight">Artistas Destacados</h2>
-          <span className="text-sm text-neutral-500 font-medium">
-            {filteredArtists.length} {filteredArtists.length === 1 ? "artista" : "artistas"} disponibles
+      {/* Filtros Rápidos */}
+      <section className="mt-8 flex flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+            Fandoms & Estilos:
           </span>
+          {POPULAR_TAGS.map((tag) => (
+            <button
+              key={tag}
+              type="button"
+              onClick={() => setSelectedTag(tag)}
+              className={`rounded-full px-3.5 py-1 text-xs font-semibold transition ${
+                selectedTag === tag
+                  ? "bg-purple-600 text-white shadow-sm"
+                  : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+              }`}
+            >
+              {tag === "Todos" ? "✨ Todos" : `#${tag}`}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-4 border-t border-slate-100 pt-3 text-sm">
+          <div className="flex flex-wrap items-center gap-3">
+            <label htmlFor="status-filter" className="text-xs font-semibold text-slate-600">
+              Estado:
+            </label>
+            <select
+              id="status-filter"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-800"
+            >
+              <option value="ALL">Todos los estados</option>
+              <option value="OPEN">🟢 Comisiones Abiertas</option>
+              <option value="WAITLIST">🟡 Lista de Espera</option>
+            </select>
+
+            <label htmlFor="price-filter" className="text-xs font-semibold text-slate-600">
+              Presupuesto máx:
+            </label>
+            <select
+              id="price-filter"
+              value={maxPrice}
+              onChange={(e) => setMaxPrice(e.target.value)}
+              className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-800"
+            >
+              <option value="">Sin límite</option>
+              <option value="30000">Hasta $30.000 ARS</option>
+              <option value="50000">Hasta $50.000 ARS</option>
+              <option value="100000">Hasta $100.000 ARS</option>
+            </select>
+          </div>
+
+          <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-slate-600">
+            <input
+              type="checkbox"
+              checked={showSuggestive}
+              onChange={(e) => setShowSuggestive(e.target.checked)}
+              className="h-4 w-4 rounded border-slate-300 text-purple-600 focus:ring-purple-500"
+            />
+            <span>Mostrar arte Suggestive / +18</span>
+          </label>
+        </div>
+      </section>
+
+      {/* Listado de Artistas y Puestitos */}
+      <section className="mt-8">
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-xl font-bold text-slate-900">
+            🎨 Puestitos de Artistas Destacados ({artists.length})
+          </h2>
+          <Link
+            href="/login"
+            className="text-xs font-semibold text-purple-700 hover:underline"
+          >
+            ¿Querés probar con cuenta demo? Ingresá acá →
+          </Link>
         </div>
 
         {loading ? (
-          <div className="text-center py-20 text-neutral-400">Cargando puestitos de arte... ✨</div>
-        ) : filteredArtists.length === 0 ? (
-          <div className="text-center py-16 bg-white rounded-2xl border border-neutral-200">
-            <p className="text-neutral-500 font-medium">No se encontraron artistas con ese término.</p>
+          <div className="grid gap-6 md:grid-cols-2">
+            {[1, 2].map((n) => (
+              <div
+                key={n}
+                className="h-80 animate-pulse rounded-2xl border border-slate-200 bg-white p-6"
+              />
+            ))}
+          </div>
+        ) : artists.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-12 text-center">
+            <p className="text-lg font-semibold text-slate-700">
+              No encontramos artistas con esos filtros, nya~ (´• ω •`)
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                setSearchQuery("");
+                setSelectedTag("Todos");
+                setStatusFilter("ALL");
+                setMaxPrice("");
+              }}
+              className="mt-4 rounded-xl bg-purple-600 px-4 py-2 text-sm font-semibold text-white hover:bg-purple-700"
+            >
+              Limpiar filtros
+            </button>
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {filteredArtists.map((artist) => (
-              <div
-                key={artist.id}
-                className="bg-white rounded-2xl border border-neutral-200 overflow-hidden shadow-sm hover:shadow-md transition flex flex-col"
-              >
-                {/* Banner & Avatar */}
-                <div className="h-28 bg-purple-100 relative">
-                  {artist.bannerUrl && (
-                    <img
-                      src={artist.bannerUrl}
-                      alt={artist.displayName}
-                      className="w-full h-full object-cover"
-                    />
-                  )}
-                  <div className="absolute -bottom-6 left-4">
-                    <img
-                      src={artist.avatarUrl || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=150&q=80"}
-                      alt={artist.displayName}
-                      className="w-14 h-14 rounded-full border-2 border-white object-cover shadow-sm bg-white"
-                    />
-                  </div>
-                  {artist.commissionStatus === "OPEN" && (
-                    <span className="absolute top-3 right-3 bg-emerald-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider shadow">
-                      Comisiones Abiertas
-                    </span>
-                  )}
-                </div>
+          <div className="grid gap-6 md:grid-cols-2">
+            {artists.map((artist, artistIdx) => {
+              const minPrice =
+                artist.services.length > 0
+                  ? Math.min(...artist.services.map((s) => s.priceArs))
+                  : null;
 
-                {/* Info */}
-                <div className="pt-8 p-5 flex-1 flex flex-col justify-between space-y-4">
-                  <div>
-                    <div className="flex items-center gap-1.5">
-                      <h3 className="font-bold text-neutral-900 text-base">{artist.displayName}</h3>
-                      {artist.isVerifiedHuman && (
-                        <span title="Artista Humano Verificado" className="text-purple-600 text-xs">
-                          ✓
+              return (
+                <article
+                  key={artist.id}
+                  className="flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition hover:shadow-md"
+                >
+                  {/* Mini galería superior */}
+                  <div className="grid h-44 grid-cols-3 gap-1 bg-slate-100">
+                    {artist.portfolio.slice(0, 3).map((item, idx) => (
+                      <div key={item.id} className="relative h-44 w-full overflow-hidden">
+                        {item.imageUrl ? (<img
+                          src={resolveImageUrl(item.imageUrl)}
+                          alt={item.title}
+                          {...(artistIdx === 0 && idx === 0
+                            ? ({ fetchPriority: "high" } as any)
+                            : { loading: "lazy" })}
+                          className="h-full w-full object-cover transition duration-300 hover:scale-105"
+                        />) : (
+                          <div className="flex h-full items-center justify-center bg-slate-200 text-xs font-bold text-slate-500">+18</div>
+                        )}
+                        {item.rating !== "SFW" && (
+                          <span className="absolute right-1.5 top-1.5 rounded bg-rose-600/90 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                            {item.rating}
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                    {artist.portfolio.length === 0 && (
+                      <div className="col-span-3 flex items-center justify-center text-xs text-slate-400">
+                        Sin muestras en galería aún
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Info del Artista */}
+                  <div className="flex flex-1 flex-col justify-between p-5">
+                    <div>
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <img
+                            src={resolveImageUrl(artist.avatarUrl)}
+                            alt={artist.displayName}
+                            loading="lazy"
+                            className="h-12 w-12 rounded-full border-2 border-purple-200 object-cover"
+                          />
+                          <div>
+                            <div className="flex items-center gap-1.5">
+                              <Link
+                                href={`/u/${artist.username}`}
+                                className="text-lg font-bold text-slate-900 hover:text-purple-700"
+                              >
+                                {artist.displayName}
+                              </Link>
+                              {artist.isVerifiedHuman && (
+                                <span
+                                  title="Artista 100% Humano Verificado (Sin IA)"
+                                  className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-bold text-emerald-800"
+                                >
+                                  ✓ Humano
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-slate-500">
+                              @{artist.username}
+                              {artist.avgRating && (
+                                <span className="ml-2 font-semibold text-amber-600">
+                                  ★ {artist.avgRating} ({artist.reviewCount})
+                                </span>
+                              )}
+                            </p>
+                          </div>
+                        </div>
+
+                        <span
+                          className={`rounded-full px-2.5 py-1 text-xs font-bold ${
+                            artist.commissionStatus === "OPEN"
+                              ? "bg-emerald-100 text-emerald-800"
+                              : artist.commissionStatus === "WAITLIST"
+                              ? "bg-amber-100 text-amber-800"
+                              : "bg-slate-100 text-slate-600"
+                          }`}
+                        >
+                          {artist.commissionStatus === "OPEN"
+                            ? "🟢 Abiertas"
+                            : artist.commissionStatus === "WAITLIST"
+                            ? "🟡 Waitlist"
+                            : "🔴 Cerradas"}
                         </span>
+                      </div>
+
+                      <p className="mt-3 line-clamp-2 text-sm text-slate-600">{artist.bio}</p>
+
+                      {/* Servicios */}
+                      {artist.services.length > 0 && (
+                        <div className="mt-4 space-y-2 border-t border-slate-100 pt-3">
+                          {artist.services.slice(0, 2).map((srv) => (
+                            <div
+                              key={srv.id}
+                              className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2 text-xs"
+                            >
+                              <div className="truncate pr-2">
+                                <span className="font-semibold text-slate-800">{srv.title}</span>
+                                <span className="ml-2 rounded bg-purple-100 px-1.5 py-0.5 text-[10px] font-medium text-purple-800">
+                                  {srv.paymentPlan === "FULL_100"
+                                    ? "100% inicial"
+                                    : srv.paymentPlan === "SPLIT_ON_SKETCH"
+                                    ? "50/50 en Boceto"
+                                    : "50/50 en Preview Final"}
+                                </span>
+                              </div>
+                              <span className="whitespace-nowrap font-bold text-purple-700">
+                                ${srv.priceArs.toLocaleString("es-AR")} ARS
+                              </span>
+                            </div>
+                          ))}
+                        </div>
                       )}
                     </div>
-                    <p className="text-xs text-neutral-400 font-medium mb-2">@{artist.username}</p>
-                    <p className="text-xs text-neutral-600 line-clamp-2 leading-relaxed">
-                      {artist.bio || "Ilustrador independiente en TuPuestito."}
-                    </p>
-                  </div>
 
-                  {/* Portfolio Preview Muestras */}
-                  {artist.portfolio && artist.portfolio.length > 0 && (
-                    <div className="grid grid-cols-3 gap-1.5 rounded-lg overflow-hidden">
-                      {artist.portfolio.slice(0, 3).map((item: any) => (
-                        <img
-                          key={item.id}
-                          src={item.imageUrl.startsWith("http") ? item.imageUrl : `http://localhost:4000${item.imageUrl}`}
-                          alt={item.title}
-                          className="w-full h-16 object-cover bg-neutral-100"
-                        />
-                      ))}
+                    <div className="mt-5 flex items-center justify-between border-t border-slate-100 pt-4">
+                      <div className="text-xs text-slate-500">
+                        {minPrice ? (
+                          <>
+                            Desde{" "}
+                            <strong className="text-sm text-slate-900">
+                              ${minPrice.toLocaleString("es-AR")} ARS
+                            </strong>
+                          </>
+                        ) : (
+                          "Consultar servicios"
+                        )}
+                      </div>
+                      <Link
+                        href={`/u/${artist.username}`}
+                        className="rounded-xl bg-purple-600 px-4 py-2 text-xs font-bold text-white transition hover:bg-purple-700"
+                      >
+                        Ver Puestito y Comisiones →
+                      </Link>
                     </div>
-                  )}
-
-                  {/* Precios y botón */}
-                  <div className="pt-3 border-t border-neutral-100 flex items-center justify-between">
-                    <div>
-                      <span className="text-[10px] text-neutral-400 block font-semibold uppercase">Desde</span>
-                      <span className="font-extrabold text-neutral-900 text-sm">
-                        ${artist.services?.[0]?.priceArs ? artist.services[0].priceArs.toLocaleString("es-AR") : "Consultar"} ARS
-                      </span>
-                    </div>
-
-                    <Link
-                      href={`/u/${artist.username}`}
-                      className="text-xs font-bold bg-purple-50 text-purple-700 hover:bg-purple-100 px-3 py-1.5 rounded-lg transition"
-                    >
-                      Ver Puestito →
-                    </Link>
                   </div>
-                </div>
-              </div>
-            ))}
+                </article>
+              );
+            })}
           </div>
         )}
       </section>
-    </div>
+    </main>
   );
 }

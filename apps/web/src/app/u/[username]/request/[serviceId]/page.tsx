@@ -1,277 +1,392 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
-import { useRouter } from "next/navigation";
+import React, { useEffect, useState } from "react";
 import Link from "next/link";
-import { fetchApi } from "../../../../../lib/api";
-import { ShieldCheck, Info, UploadCloud, AlertCircle } from "lucide-react";
+import { useParams, useRouter } from "next/navigation";
+import { apiFetch, uploadReference } from "@/lib/api";
+import { useMe } from "@/lib/useMe";
 
-export default function CommissionRequestPage({
-  params
-}: {
-  params: Promise<{ username: string; serviceId: string }>;
-}) {
-  const resolvedParams = use(params);
-  const { username, serviceId } = resolvedParams;
+type Addon = { id: string; name: string; priceArs: number };
+type Ref = { key: string; preview: string; name: string };
+
+const MAX_REFS = 10;
+
+export default function CommissionRequestPage() {
+  const params = useParams<{ username: string; serviceId: string }>();
+  const username = params?.username || "";
+  const serviceId = params?.serviceId || "";
   const router = useRouter();
+  const { user, loading: userLoading } = useMe();
 
-  const [artistData, setArtistData] = useState<any>(null);
+  const [artist, setArtist] = useState<any>(null);
   const [service, setService] = useState<any>(null);
-  const [brief, setBrief] = useState("");
+  const [notFound, setNotFound] = useState(false);
+  const [buyerBrief, setBuyerBrief] = useState("");
   const [externalBoardUrl, setExternalBoardUrl] = useState("");
-  const [refUrls, setRefUrls] = useState<string[]>([]);
-  const [currentRefInput, setCurrentRefInput] = useState("");
-  const [acceptedToS, setAcceptedToS] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
+  const [refs, setRefs] = useState<Ref[]>([]);
+  const [uploadingRef, setUploadingRef] = useState(false);
+  const [selectedAddons, setSelectedAddons] = useState<string[]>([]);
+  const [acceptedTerms, setAcceptedTerms] = useState(false);
   const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    fetchApi(`/artists/${username}`)
+    if (!username) return;
+    apiFetch(`/api/artists/${username}`)
       .then((res) => {
-        setArtistData(res.artist);
-        const s = res.services?.find((x: any) => x.id === serviceId);
-        setService(s);
+        setArtist(res.artist);
+        const found = (res.services || []).find((s: any) => s.id === serviceId);
+        if (!found) setNotFound(true);
+        setService(found ?? null);
       })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
+      .catch(() => setNotFound(true));
   }, [username, serviceId]);
 
-  const handleAddRef = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (currentRefInput.trim() && refUrls.length < 10) {
-      setRefUrls([...refUrls, currentRefInput.trim()]);
-      setCurrentRefInput("");
+  useEffect(() => () => refs.forEach((r) => URL.revokeObjectURL(r.preview)), []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (notFound) {
+    return (
+      <main className="mx-auto max-w-3xl px-4 py-16 text-center">
+        <h1 className="text-xl font-bold text-slate-900">Este servicio ya no está disponible</h1>
+        <Link href={`/u/${username}`} className="mt-4 inline-block text-sm font-bold text-purple-700 hover:underline">
+          Ver el puestito de @{username}
+        </Link>
+      </main>
+    );
+  }
+
+  if (!artist || !service || userLoading) {
+    return (
+      <main className="mx-auto max-w-3xl px-4 py-12 text-center">
+        <p className="text-sm text-slate-500">Cargando formulario de comisión...</p>
+      </main>
+    );
+  }
+
+  const addonsList: Addon[] = service.addons || [];
+  const extraAmountArs = addonsList
+    .filter((a) => selectedAddons.includes(a.id))
+    .reduce((sum, a) => sum + a.priceArs, 0);
+  const totalArs = service.priceArs + extraAmountArs;
+  const isSplit = service.paymentPlan !== "FULL_100";
+  const depositArs = isSplit ? Math.round(totalArs / 2) : totalArs;
+  const finalArs = isSplit ? totalArs - depositArs : 0;
+  const secondPaymentMoment =
+    service.paymentPlan === "SPLIT_ON_SKETCH" ? "aprobar el boceto" : "aprobar la vista previa final con marca de agua";
+  const closed = artist.commissionStatus === "CLOSED" || service.slotsAvailable === 0;
+  const isOwnService = user?.id === artist.userId;
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    if (files.length === 0) return;
+    if (refs.length + files.length > MAX_REFS) {
+      setError(`Podés subir hasta ${MAX_REFS} imágenes de referencia.`);
+      return;
+    }
+    setUploadingRef(true);
+    setError("");
+    try {
+      for (const file of files) {
+        const key = await uploadReference(file);
+        setRefs((prev) => [...prev, { key, preview: URL.createObjectURL(file), name: file.name }]);
+      }
+    } catch (err: any) {
+      setError(err.status === 401 ? "Iniciá sesión para subir referencias." : err.message || "Error subiendo imagen");
+    } finally {
+      setUploadingRef(false);
     }
   };
 
-  const handleRemoveRef = (index: number) => {
-    setRefUrls(refUrls.filter((_, i) => i !== index));
+  const removeRef = (key: string) => {
+    setRefs((prev) => {
+      const r = prev.find((x) => x.key === key);
+      if (r) URL.revokeObjectURL(r.preview);
+      return prev.filter((x) => x.key !== key);
+    });
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!acceptedToS) {
-      alert("Debés aceptar los términos del artista para continuar.");
+    if (!user) {
+      router.push(`/login?next=/u/${username}/request/${serviceId}`);
       return;
     }
-
+    if (!acceptedTerms) {
+      setError("Tenés que aceptar los Términos de Servicio del artista y la modalidad de pago.");
+      return;
+    }
     setSubmitting(true);
     setError("");
-
     try {
-      const res = await fetchApi("/orders", {
+      const res = await apiFetch<{ id: string }>("/api/orders", {
         method: "POST",
         body: JSON.stringify({
-          serviceId,
-          buyerBrief: brief,
-          referenceImages: refUrls,
-          externalBoardUrl: externalBoardUrl || null
+          serviceId: service.id,
+          addonIds: selectedAddons,
+          buyerBrief,
+          referenceKeys: refs.map((r) => r.key),
+          externalBoardUrl: externalBoardUrl.trim() || undefined,
+          acceptedTerms: true
         })
       });
-
       router.push(`/orders/${res.id}`);
     } catch (err: any) {
-      setError(err.message || "Error al enviar la solicitud. Asegurate de haber iniciado sesión.");
-    } finally {
+      setError(err.message || "No se pudo enviar la solicitud");
       setSubmitting(false);
     }
   };
 
-  if (loading) return <div className="text-center py-24 text-neutral-400">Cargando formulario... ✨</div>;
-
-  if (!service) {
-    return (
-      <div className="text-center py-24">
-        <h1 className="text-2xl font-bold">Servicio no encontrado</h1>
-        <Link href={`/u/${username}`} className="mt-4 inline-block text-purple-600 font-bold">
-          Volver al perfil
-        </Link>
-      </div>
-    );
-  }
-
   return (
-    <div className="max-w-3xl mx-auto px-4 py-12">
-      <div className="mb-8">
-        <Link href={`/u/${username}`} className="text-sm font-semibold text-neutral-500 hover:text-neutral-900">
-          ← Volver al puestito de {artistData?.displayName}
-        </Link>
-        <h1 className="text-3xl font-black text-neutral-900 mt-2">Solicitar Comisión: {service.title}</h1>
-        <p className="text-neutral-600 text-sm mt-1">
-          Completá los detalles de tu personaje o pedido para que el artista lo evalúe.
-        </p>
-      </div>
+    <main className="mx-auto max-w-3xl px-4 py-8">
+      <Link href={`/u/${artist.username}`} className="text-xs font-bold text-purple-700 hover:underline">
+        ← Volver al puestito de {artist.displayName}
+      </Link>
 
-      {error && (
-        <div className="mb-6 p-4 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm flex items-center gap-2">
-          <AlertCircle className="w-5 h-5 shrink-0" />
-          <span>{error}</span>
-        </div>
-      )}
-
-      {/* Resumen del Servicio */}
-      <div className="bg-white p-6 rounded-2xl border border-neutral-200 mb-8 space-y-4 shadow-sm">
-        <div className="flex items-center justify-between border-b border-neutral-100 pb-4">
-          <div>
-            <span className="text-xs uppercase font-bold text-neutral-400">Precio total</span>
-            <div className="text-2xl font-black text-neutral-900">${service.priceArs.toLocaleString("es-AR")} ARS</div>
-          </div>
-          <div className="text-right">
-            <span className="text-xs uppercase font-bold text-neutral-400">Tiempo estimado</span>
-            <div className="text-sm font-bold text-neutral-700">{service.turnaroundDays} días hábiles</div>
-          </div>
-        </div>
-
-        {/* Modalidad de pago */}
-        <div className="p-3.5 bg-purple-50 rounded-xl border border-purple-100 text-xs text-purple-900 flex items-start gap-3">
-          <ShieldCheck className="w-5 h-5 text-purple-600 shrink-0 mt-0.5" />
-          <div>
-            <span className="font-bold block text-sm">Modalidad de pago configurada por el artista:</span>
-            {service.paymentPlan === "SPLIT_ON_SKETCH" && (
-              <p className="mt-0.5">
-                <strong>50% de seña inicial</strong> (${(service.priceArs * 0.5).toLocaleString("es-AR")} ARS) una vez que el artista acepta el pedido, y el <strong>50% restante</strong> al aprobar el boceto.
-              </p>
-            )}
-            {service.paymentPlan === "SPLIT_ON_FINAL_PREVIEW" && (
-              <p className="mt-0.5">
-                <strong>50% de seña inicial</strong> (${(service.priceArs * 0.5).toLocaleString("es-AR")} ARS) para comenzar, y el <strong>50% restante</strong> recién cuando el artista termine la obra y veas la vista previa con marca de agua (antes de desbloquear la descarga en HD).
-              </p>
-            )}
-            {service.paymentPlan === "FULL_100" && (
-              <p className="mt-0.5">
-                <strong>100% de pago por adelantado</strong> (${service.priceArs.toLocaleString("es-AR")} ARS) al aceptar el pedido.
-              </p>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Formulario */}
-      <form onSubmit={handleSubmit} className="space-y-6">
-        {/* Descripción del pedido */}
-        <div className="bg-white p-6 rounded-2xl border border-neutral-200 space-y-2">
-          <label className="block text-sm font-bold text-neutral-900">
-            Descripción del encargo <span className="text-red-500">*</span>
-          </label>
-          <p className="text-xs text-neutral-500">
-            Explicá la pose, expresión, vestimenta, colores o personalidad de tu personaje.
+      <div className="mt-3 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
+        {/* 1. Resumen de condiciones (Plan §6.1) */}
+        <div className="border-b border-slate-100 pb-5">
+          <span className="rounded-full bg-purple-100 px-3 py-0.5 text-xs font-bold text-purple-800">
+            Solicitud de Comisión
+          </span>
+          <h1 className="mt-1 text-2xl font-extrabold text-slate-900">{service.title}</h1>
+          <p className="text-xs text-slate-500">
+            Artista: <strong>{artist.displayName}</strong> (@{artist.username})
           </p>
-          <textarea
-            required
-            rows={5}
-            value={brief}
-            onChange={(e) => setBrief(e.target.value)}
-            placeholder="Ej: Quiero a mi personaje original con sonrisa confiada, sosteniendo una taza de café..."
-            className="w-full p-3.5 rounded-xl border border-neutral-300 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 transition"
-          />
+          <dl className="mt-4 grid grid-cols-2 gap-3 rounded-2xl bg-slate-50 p-4 text-xs sm:grid-cols-4">
+            <div>
+              <dt className="text-slate-400">Precio base</dt>
+              <dd className="font-bold text-slate-900">${service.priceArs.toLocaleString("es-AR")}</dd>
+            </div>
+            <div>
+              <dt className="text-slate-400">Extras</dt>
+              <dd className="font-bold text-slate-900">+${extraAmountArs.toLocaleString("es-AR")}</dd>
+            </div>
+            <div>
+              <dt className="text-slate-400">Plazo / revisiones</dt>
+              <dd className="font-bold text-slate-900">
+                {service.turnaroundDays} días · {service.revisionsIncluded} rev.
+              </dd>
+            </div>
+            <div>
+              <dt className="text-slate-400">Total</dt>
+              <dd className="text-base font-extrabold text-purple-700">${totalArs.toLocaleString("es-AR")} ARS</dd>
+            </div>
+          </dl>
+          <p className="mt-2 text-xs font-semibold text-purple-800">
+            Modalidad:{" "}
+            {service.paymentPlan === "FULL_100"
+              ? "100% al inicio"
+              : `50% de seña al aceptar el pedido y 50% al ${secondPaymentMoment}`}
+          </p>
         </div>
 
-        {/* Referencias Visuales (hasta 10) */}
-        <div className="bg-white p-6 rounded-2xl border border-neutral-200 space-y-4">
+        {closed && (
+          <div className="mt-4 rounded-xl bg-amber-50 p-3.5 text-xs font-bold text-amber-800">
+            ⏸️ Este servicio no está tomando pedidos en este momento.
+          </div>
+        )}
+        {isOwnService && (
+          <div className="mt-4 rounded-xl bg-slate-100 p-3.5 text-xs font-bold text-slate-700">
+            Este es tu propio servicio: así lo ven tus compradores.
+          </div>
+        )}
+        {error && <div className="mt-4 rounded-xl bg-rose-50 p-3.5 text-xs font-bold text-rose-700">⚠️ {error}</div>}
+
+        <form onSubmit={handleSubmit} className="mt-6 space-y-6">
+          {/* 2. Brief */}
           <div>
-            <label className="block text-sm font-bold text-neutral-900">
-              Imágenes de Referencia ({refUrls.length}/10)
+            <label htmlFor="brief-textarea" className="block text-sm font-bold text-slate-800">
+              Descripción del pedido *
             </label>
-            <p className="text-xs text-neutral-500">
-              Pegá URLs directas de imágenes de tu personaje o referencias de paleta de colores/ropa.
-            </p>
-          </div>
-
-          <div className="flex gap-2">
-            <input
-              type="url"
-              placeholder="https://ejemplo.com/imagen.png"
-              value={currentRefInput}
-              onChange={(e) => setCurrentRefInput(e.target.value)}
-              className="flex-1 p-2.5 rounded-lg border border-neutral-300 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+            <textarea
+              id="brief-textarea"
+              required
+              minLength={10}
+              maxLength={8000}
+              rows={6}
+              value={buyerBrief}
+              onChange={(e) => setBuyerBrief(e.target.value)}
+              placeholder="Personalidad del personaje, pose deseada, expresión, detalles importantes que no deben faltar..."
+              className="mt-2 w-full rounded-xl border border-slate-300 p-3.5 text-sm focus:border-purple-600 focus:outline-none"
             />
-            <button
-              type="button"
-              onClick={handleAddRef}
-              disabled={refUrls.length >= 10 || !currentRefInput.trim()}
-              className="bg-neutral-900 text-white text-xs font-bold px-4 py-2.5 rounded-lg disabled:opacity-40"
-            >
-              Agregar
-            </button>
           </div>
 
-          {refUrls.length > 0 && (
-            <div className="flex flex-wrap gap-2 pt-2">
-              {refUrls.map((url, i) => (
-                <div
-                  key={i}
-                  className="flex items-center gap-2 bg-neutral-100 text-neutral-700 px-3 py-1.5 rounded-lg text-xs"
-                >
-                  <span className="truncate max-w-[200px]">{url}</span>
-                  <button
-                    type="button"
-                    onClick={() => handleRemoveRef(i)}
-                    className="text-red-500 hover:text-red-700 font-bold"
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
+          {/* Extras */}
+          {addonsList.length > 0 && (
+            <div>
+              <span className="block text-sm font-bold text-slate-800">Extras opcionales</span>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                {addonsList.map((addon) => {
+                  const checked = selectedAddons.includes(addon.id);
+                  return (
+                    <label
+                      key={addon.id}
+                      className={`flex cursor-pointer items-center justify-between rounded-xl border p-3 text-xs transition ${
+                        checked ? "border-purple-600 bg-purple-50 font-semibold" : "border-slate-200 hover:bg-slate-50"
+                      }`}
+                    >
+                      <span className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() =>
+                            setSelectedAddons((prev) =>
+                              checked ? prev.filter((id) => id !== addon.id) : [...prev, addon.id]
+                            )
+                          }
+                          className="h-4 w-4 rounded text-purple-600"
+                        />
+                        {addon.name}
+                      </span>
+                      <span className="font-bold text-purple-700">+${addon.priceArs.toLocaleString("es-AR")}</span>
+                    </label>
+                  );
+                })}
+              </div>
             </div>
           )}
-        </div>
 
-        {/* Tablero externo (Excalidraw, Miro, Drive) */}
-        <div className="bg-white p-6 rounded-2xl border border-neutral-200 space-y-2">
-          <label className="block text-sm font-bold text-neutral-900">
-            Tablero de Referencias Externo (Opcional)
-          </label>
-          <div className="p-3 bg-amber-50 rounded-xl text-xs text-amber-800 flex items-start gap-2 mb-2">
-            <Info className="w-4 h-4 shrink-0 mt-0.5" />
-            <span>
-              💡 <strong>Tip pro:</strong> Para composiciones complejas, te sugerimos armar un lienzo gratis en{" "}
-              <a href="https://excalidraw.com" target="_blank" rel="noreferrer" className="underline font-bold">
+          {/* 3. Referencias (hasta 10, PNG/JPG/WebP, 5 MB) */}
+          <div>
+            <div className="flex items-center justify-between">
+              <span className="block text-sm font-bold text-slate-800">
+                Referencias visuales ({refs.length}/{MAX_REFS})
+              </span>
+              <span className="text-xs text-slate-400">PNG, JPG o WebP · máx. 5 MB c/u</span>
+            </div>
+            <label
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault();
+                handleFileUpload({ target: { files: e.dataTransfer.files, value: "" } } as any);
+              }}
+              className={`mt-2 flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-slate-300 bg-slate-50 p-6 text-center text-xs text-slate-600 hover:border-purple-400 ${
+                refs.length >= MAX_REFS ? "pointer-events-none opacity-50" : ""
+              }`}
+            >
+              <span className="text-2xl">📤</span>
+              <span className="mt-1 font-bold text-purple-700">
+                {uploadingRef ? "Subiendo..." : "Arrastrá tus imágenes acá o hacé clic para elegirlas"}
+              </span>
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                multiple
+                onChange={handleFileUpload}
+                className="hidden"
+                disabled={!user || uploadingRef || refs.length >= MAX_REFS}
+              />
+              {!user && <span className="mt-1 text-amber-700">Iniciá sesión para subir referencias.</span>}
+            </label>
+
+            {refs.length > 0 && (
+              <div className="mt-3 grid grid-cols-5 gap-2">
+                {refs.map((r, i) => (
+                  <div key={r.key} className="relative h-20 overflow-hidden rounded-xl border border-slate-200 bg-white">
+                    <img src={r.preview} alt={`Referencia ${i + 1}`} className="h-full w-full object-cover" />
+                    <button
+                      type="button"
+                      onClick={() => removeRef(r.key)}
+                      aria-label={`Quitar ${r.name}`}
+                      className="absolute right-1 top-1 rounded-full bg-rose-600 px-1.5 py-0.5 text-[10px] font-bold text-white"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 4. Tablero externo */}
+          <div>
+            <label htmlFor="board-url" className="block text-sm font-bold text-slate-800">
+              Link a tablero externo (opcional)
+            </label>
+            <p className="text-xs text-slate-500">
+              💡 ¿Querés explicarle mejor la pose o composición al artista? Te recomendamos armar un lienzo gratis en{" "}
+              <a href="https://excalidraw.com" target="_blank" rel="noreferrer" className="font-bold text-purple-700 underline">
                 Excalidraw
               </a>
               , Miro o Google Drive y pegar el link compartido acá.
-            </span>
-          </div>
-          <input
-            type="url"
-            placeholder="https://excalidraw.com/#room=... o link a Drive"
-            value={externalBoardUrl}
-            onChange={(e) => setExternalBoardUrl(e.target.value)}
-            className="w-full p-3 rounded-xl border border-neutral-300 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
-          />
-        </div>
-
-        {/* Términos del Artista y Checkbox Obligatorio */}
-        <div className="bg-white p-6 rounded-2xl border border-neutral-200 space-y-4">
-          <h4 className="text-sm font-bold text-neutral-900">Términos de Servicio del Artista</h4>
-          <div className="p-4 bg-neutral-50 rounded-xl text-xs text-neutral-600 max-h-36 overflow-y-auto whitespace-pre-line border border-neutral-100">
-            {artistData?.termsOfService || "Términos estándar de TuPuestito: Uso personal, prohibido entrenar modelos de IA generativa."}
-          </div>
-
-          <label className="flex items-start gap-3 cursor-pointer pt-2">
+            </p>
             <input
-              type="checkbox"
-              required
-              checked={acceptedToS}
-              onChange={(e) => setAcceptedToS(e.target.checked)}
-              className="mt-1 w-4 h-4 rounded text-purple-600 focus:ring-purple-500 border-neutral-300"
+              id="board-url"
+              type="url"
+              pattern="https://.*"
+              title="El link debe empezar con https://"
+              value={externalBoardUrl}
+              onChange={(e) => setExternalBoardUrl(e.target.value)}
+              placeholder="https://excalidraw.com/#json=..."
+              className="mt-2 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-purple-600 focus:outline-none"
             />
-            <span className="text-xs text-neutral-700 leading-relaxed">
-              He leído y acepto los <strong>Términos de Servicio de @{artistData?.username}</strong> y de TuPuestito.
-              Entiendo que la seña inicial no es reembolsable una vez aprobado el boceto.
-            </span>
-          </label>
-        </div>
+          </div>
 
-        <button
-          type="submit"
-          disabled={submitting}
-          className="w-full bg-purple-600 hover:bg-purple-700 text-white font-black py-4 rounded-2xl shadow-lg transition disabled:opacity-50 text-base"
-        >
-          {submitting ? "Enviando solicitud..." : "Enviar Solicitud al Artista ✨"}
-        </button>
-      </form>
-    </div>
+          {/* 5. Términos + checkbox legal */}
+          <div className="rounded-2xl border border-purple-200 bg-purple-50/60 p-5">
+            <h3 className="text-sm font-extrabold text-purple-950">Plan de pagos</h3>
+            <div className="mt-2 space-y-1.5 text-xs text-slate-700">
+              <div className="flex justify-between">
+                <span>1° pago (al aceptar el artista tu solicitud):</span>
+                <strong>
+                  ${depositArs.toLocaleString("es-AR")} ARS ({isSplit ? "50% seña" : "100%"})
+                </strong>
+              </div>
+              {isSplit && (
+                <div className="flex justify-between">
+                  <span>2° pago (al {secondPaymentMoment}):</span>
+                  <strong>${finalArs.toLocaleString("es-AR")} ARS (50%)</strong>
+                </div>
+              )}
+            </div>
+
+            <details className="mt-4 rounded-xl bg-white p-3 text-xs text-slate-600">
+              <summary className="cursor-pointer font-bold text-slate-800">
+                Leer los Términos de Servicio de @{artist.username}
+              </summary>
+              <p className="mt-2 whitespace-pre-line">
+                {artist.termsOfService || "El artista no publicó términos propios; aplican los Términos de TuPuestito."}
+              </p>
+            </details>
+
+            <label className="mt-4 flex cursor-pointer items-start gap-2.5 text-xs text-slate-800">
+              <input
+                type="checkbox"
+                required
+                checked={acceptedTerms}
+                onChange={(e) => setAcceptedTerms(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-purple-400 text-purple-600"
+              />
+              <span>
+                Entiendo y acepto los Términos de Servicio de <strong>@{artist.username}</strong> y la modalidad de pago
+                elegida (
+                <strong>
+                  {isSplit
+                    ? `50% de seña al aceptar el pedido y 50% al ${secondPaymentMoment}`
+                    : "100% al aceptar el pedido"}
+                </strong>
+                ). Entiendo que la seña inicial no es reembolsable una vez entregado el boceto.
+              </span>
+            </label>
+          </div>
+
+          <button
+            type="submit"
+            disabled={submitting || uploadingRef || closed || isOwnService}
+            className="w-full rounded-2xl bg-purple-600 py-3.5 text-sm font-extrabold text-white shadow-md transition hover:bg-purple-700 disabled:opacity-50"
+          >
+            {!user
+              ? "Iniciá sesión para enviar la solicitud"
+              : submitting
+              ? "Enviando solicitud..."
+              : `Enviar solicitud ($${totalArs.toLocaleString("es-AR")} ARS)`}
+          </button>
+          <p className="text-center text-[11px] text-slate-400">
+            No se cobra nada hasta que el artista acepte tu pedido.
+          </p>
+        </form>
+      </div>
+    </main>
   );
 }
-

@@ -1,0 +1,63 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docker-check:
+    name: Docker Image Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build API Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: false
+          tags: tupuestito-api:${{ github.sha }}
+
+      - name: Build Web Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: false
+          build-args: |
+            NEXT_PUBLIC_API_URL=https://api.tupuestito.com
+            NEXT_PUBLIC_SITE_URL=https://tupuestito.com
+          tags: tupuestito-web:${{ github.sha }}
+
+  deploy:
+    name: Deploy
+    needs: docker-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Target Environment
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "Environment: PRODUCTION"
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            echo "Environment: STAGING"
+          fi
+
+      - name: Trigger Webhook Deploy (if configured)
+        if: env.DEPLOY_WEBHOOK_URL != ''
+        env:
+          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+        run: |
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"ref\":\"${{ github.ref }}\",\"sha\":\"${{ github.sha }}\"}" \
+            "${{ secrets.DEPLOY_WEBHOOK_URL }}"

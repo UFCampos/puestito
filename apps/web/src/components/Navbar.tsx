@@ -1,85 +1,104 @@
 "use client";
 
+import React from "react";
 import Link from "next/link";
-import { useEffect, useState } from "react";
-import { fetchApi } from "../lib/api";
-import { Palette, User, LogOut, LayoutDashboard, ShoppingBag } from "lucide-react";
+import { usePathname, useRouter } from "next/navigation";
+import { authClient } from "@/lib/api";
+import { useMe } from "@/lib/useMe";
 
 export function Navbar() {
-  const [user, setUser] = useState<any>(null);
-
-  useEffect(() => {
-    fetchApi("/auth/me")
-      .then((data) => setUser(data?.user))
-      .catch(() => setUser(null));
-  }, []);
+  const pathname = usePathname();
+  const router = useRouter();
+  const { user, artistProfile, loading, reload } = useMe([pathname]);
 
   const handleLogout = async () => {
-    await fetchApi("/auth/logout", { method: "POST" });
-    window.location.href = "/";
+    try {
+      await authClient.signOut();
+    } catch {
+      // ignore
+    }
+    await reload();
+    router.push("/");
+    router.refresh();
   };
 
   return (
-    <header className="sticky top-0 z-50 bg-white/90 backdrop-blur border-b border-neutral-200">
-      <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
-        <Link href="/" className="flex items-center gap-2 font-black text-xl text-neutral-900 tracking-tight">
-          <span className="text-2xl">🎪</span>
-          <span>TuPuestito</span>
-          <span className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">
-            Beta
-          </span>
-        </Link>
-
-        <div className="flex items-center gap-4">
-          <Link href="/" className="text-sm font-medium text-neutral-600 hover:text-neutral-900">
-            Explorar Artistas
+    <header className="sticky top-0 z-40 border-b border-purple-100 bg-white/90 backdrop-blur-md">
+      <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
+        <div className="flex items-center gap-6">
+          <Link href="/" className="flex items-center gap-2 text-xl font-extrabold text-purple-700">
+            <span className="text-2xl">🎪</span>
+            <span>TuPuestito</span>
+            <span className="rounded-full bg-purple-100 px-2 py-0.5 text-xs font-semibold text-purple-800">
+              AR Beta
+            </span>
           </Link>
+          <nav className="hidden items-center gap-4 text-sm font-medium text-slate-600 md:flex">
+            <Link href="/" className="hover:text-purple-700">
+              Explorar Comisiones
+            </Link>
+            <Link href="/anti-ai-policy" className="hover:text-purple-700">
+              🛡️ 100% Arte Humano
+            </Link>
+          </nav>
+        </div>
 
-          {user ? (
-            <div className="flex items-center gap-3">
-              {user.role === "ARTIST" ? (
-                <Link
-                  href="/dashboard"
-                  className="flex items-center gap-1.5 text-sm font-semibold bg-neutral-900 text-white px-3.5 py-1.5 rounded-lg hover:bg-neutral-800 transition"
-                >
-                  <LayoutDashboard className="w-4 h-4" />
-                  Mi Puestito
-                </Link>
+        <div className="flex items-center gap-3">
+          {!loading && user ? (
+            <>
+              <Link
+                href="/my-orders"
+                className="rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+              >
+                📦 Mis Pedidos
+              </Link>
+              {artistProfile ? (
+                <>
+                  <Link
+                    href={`/u/${user.username}`}
+                    className="hidden rounded-lg border border-purple-200 bg-purple-50 px-3 py-1.5 text-sm font-semibold text-purple-700 hover:bg-purple-100 sm:inline-block"
+                  >
+                    🎨 Mi Puestito
+                  </Link>
+                  <Link
+                    href="/dashboard"
+                    className="rounded-lg bg-purple-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-purple-700"
+                  >
+                    ⚙️ Panel Artista
+                  </Link>
+                </>
               ) : (
                 <Link
-                  href="/orders"
-                  className="flex items-center gap-1.5 text-sm font-semibold bg-neutral-900 text-white px-3.5 py-1.5 rounded-lg hover:bg-neutral-800 transition"
+                  href="/dashboard"
+                  className="hidden rounded-lg border border-purple-200 px-3 py-1.5 text-sm font-semibold text-purple-700 hover:bg-purple-50 sm:inline-block"
                 >
-                  <ShoppingBag className="w-4 h-4" />
-                  Mis Pedidos
+                  🎨 Abrir mi Puestito
                 </Link>
               )}
-
-              <span className="text-sm font-medium text-neutral-700">@{user.username}</span>
               <button
+                type="button"
                 onClick={handleLogout}
-                className="text-neutral-400 hover:text-neutral-600 p-1.5 rounded-lg hover:bg-neutral-100 transition"
-                title="Cerrar sesión"
+                className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-800"
               >
-                <LogOut className="w-4 h-4" />
+                Salir ({user.username})
               </button>
-            </div>
-          ) : (
-            <div className="flex items-center gap-2">
+            </>
+          ) : !loading ? (
+            <>
               <Link
                 href="/login"
-                className="text-sm font-medium text-neutral-700 hover:text-neutral-900 px-3 py-1.5 rounded-lg hover:bg-neutral-100 transition"
+                className="rounded-lg px-3.5 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-100"
               >
-                Iniciar sesión
+                Ingresar
               </Link>
               <Link
                 href="/register"
-                className="text-sm font-semibold bg-purple-600 text-white px-3.5 py-1.5 rounded-lg hover:bg-purple-700 shadow-sm transition"
+                className="rounded-lg bg-purple-600 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-purple-700"
               >
-                Abrir Puestito
+                Crear Cuenta / Puestito
               </Link>
-            </div>
-          )}
+            </>
+          ) : null}
         </div>
       </div>
     </header>

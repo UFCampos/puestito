@@ -1,263 +1,422 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import React, { useEffect, useState } from "react";
 import Link from "next/link";
-import { fetchApi } from "../../../lib/api";
-import { Sparkles, ShieldCheck, Clock, Layers, Star, ExternalLink, ArrowRight } from "lucide-react";
+import { useParams } from "next/navigation";
+import { apiFetch, resolveImageUrl } from "@/lib/api";
+import { useRouter } from "next/navigation";
 
-export default function ArtistProfilePage({ params }: { params: Promise<{ username: string }> }) {
-  const resolvedParams = use(params);
-  const username = resolvedParams.username;
+export default function ArtistProfilePage() {
+  const params = useParams<{ username: string }>();
+  const username = params?.username || "";
 
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<"services" | "portfolio" | "reviews">("services");
+  const [activeTab, setActiveTab] = useState<"services" | "portfolio" | "tos">("services");
+  const [selectedPortfolioTag, setSelectedPortfolioTag] = useState("Todos");
+  const [revealNsfw, setRevealNsfw] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  const router = useRouter();
+
+  const enableAdultContent = async () => {
+    if (!confirm("Confirmo que soy mayor de 18 años y quiero ver contenido +18.")) return;
+    try {
+      await apiFetch("/api/me/preferences", {
+        method: "PUT",
+        body: JSON.stringify({ showNsfw: true, confirmAdult: true })
+      });
+      setReloadKey((k) => k + 1);
+    } catch {
+      router.push(`/login?next=/u/${username}`);
+    }
+  };
 
   useEffect(() => {
-    fetchApi(`/artists/${username}`)
+    if (!username) return;
+    setLoading(true);
+    apiFetch(`/api/artists/${username}`)
       .then((res) => setData(res))
       .catch((err) => console.error(err))
       .finally(() => setLoading(false));
-  }, [username]);
+  }, [username, reloadKey]);
 
   if (loading) {
-    return <div className="text-center py-24 text-neutral-400">Cargando perfil del artista... ✨</div>;
-  }
-
-  if (!data?.artist) {
     return (
-      <div className="text-center py-24">
-        <h1 className="text-2xl font-bold text-neutral-800">Artista no encontrado</h1>
-        <p className="text-neutral-500 mt-2">El usuario @{username} no existe o no tiene un perfil activo.</p>
-        <Link href="/" className="inline-block mt-4 text-purple-600 font-bold hover:underline">
-          Volver al inicio
-        </Link>
-      </div>
+      <main className="mx-auto max-w-5xl px-4 py-10">
+        <div className="h-64 animate-pulse rounded-3xl bg-slate-200" />
+      </main>
     );
   }
 
-  const { artist, portfolio, services, reviews } = data;
+  if (!data || !data.artist) {
+    return (
+      <main className="mx-auto max-w-3xl px-4 py-16 text-center">
+        <h1 className="text-2xl font-bold text-slate-800">Artista no encontrado (´• ω •`)</h1>
+        <Link
+          href="/"
+          className="mt-4 inline-block rounded-xl bg-purple-600 px-5 py-2.5 text-sm font-bold text-white"
+        >
+          Volver al inicio
+        </Link>
+      </main>
+    );
+  }
+
+  const { artist, portfolio = [], services = [], reviews = [] } = data;
+
+  const allPortfolioTags: string[] = ["Todos"];
+  portfolio.forEach((item: any) => {
+    (item.tags || []).forEach((t: string) => {
+      if (!allPortfolioTags.includes(t)) allPortfolioTags.push(t);
+    });
+  });
+
+  const filteredPortfolio =
+    selectedPortfolioTag === "Todos"
+      ? portfolio
+      : portfolio.filter((item: any) => (item.tags || []).includes(selectedPortfolioTag));
+
+  const copyBioLink = () => {
+    navigator.clipboard.writeText(window.location.href);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2500);
+  };
 
   return (
-    <div className="pb-20">
-      {/* Banner */}
-      <div className="h-48 md:h-64 bg-gradient-to-r from-purple-200 to-pink-200 relative">
-        {artist.bannerUrl && (
-          <img src={artist.bannerUrl} alt="Banner" className="w-full h-full object-cover" />
-        )}
-      </div>
-
-      {/* Info Principal */}
-      <div className="max-w-5xl mx-auto px-4 relative -mt-16 sm:-mt-20">
-        <div className="bg-white rounded-2xl border border-neutral-200 p-6 sm:p-8 shadow-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6">
-          <div className="flex items-center gap-5">
+    <main className="mx-auto max-w-5xl px-4 pb-16 pt-6">
+      {/* Banner y Cabecera */}
+      <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
+        <div className="relative h-48 w-full bg-gradient-to-r from-purple-700 to-indigo-700 sm:h-64">
+          {artist.bannerUrl && (
             <img
-              src={artist.avatarUrl || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=200&q=80"}
-              alt={artist.displayName}
-              className="w-24 h-24 sm:w-28 sm:h-28 rounded-full border-4 border-white shadow-md object-cover bg-white"
+              src={resolveImageUrl(artist.bannerUrl)}
+              alt={`Banner de ${artist.displayName}`}
+              {...({ fetchPriority: "high" } as any)}
+              className="h-full w-full object-cover"
             />
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-2xl sm:text-3xl font-black text-neutral-900">{artist.displayName}</h1>
-                {artist.isVerifiedHuman && (
-                  <span
-                    title="Artista Humano Verificado (Sin IA)"
-                    className="bg-purple-100 text-purple-700 text-xs font-bold px-2.5 py-0.5 rounded-full flex items-center gap-1"
-                  >
-                    <Sparkles className="w-3 h-3" /> 100% Humano
-                  </span>
-                )}
+          )}
+        </div>
+
+        <div className="px-6 pb-6">
+          <div className="relative -mt-12 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-end">
+              <img
+                src={resolveImageUrl(artist.avatarUrl)}
+                alt={artist.displayName}
+                className="h-24 w-24 rounded-2xl border-4 border-white bg-white object-cover shadow-md sm:h-28 sm:w-28"
+              />
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h1 className="text-2xl font-extrabold text-slate-900 sm:text-3xl">
+                    {artist.displayName}
+                  </h1>
+                  {artist.isVerifiedHuman && (
+                    <span className="rounded-full bg-emerald-100 px-3 py-0.5 text-xs font-bold text-emerald-800">
+                      🛡️ 100% Humano Verificado
+                    </span>
+                  )}
+                </div>
+                <p className="text-sm font-medium text-slate-500">@{artist.username}</p>
               </div>
-              <p className="text-sm font-semibold text-neutral-400">@{artist.username}</p>
-              <div className="mt-2 flex items-center gap-2">
-                <span
-                  className={`text-xs font-bold px-2.5 py-0.5 rounded-full uppercase tracking-wider ${
-                    artist.commissionStatus === "OPEN"
-                      ? "bg-emerald-100 text-emerald-700"
-                      : "bg-neutral-100 text-neutral-600"
-                  }`}
-                >
-                  {artist.commissionStatus === "OPEN" ? "● Comisiones Abiertas" : "Comisiones Cerradas"}
-                </span>
-              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={`rounded-xl px-3.5 py-2 text-xs font-extrabold ${
+                  artist.commissionStatus === "OPEN"
+                    ? "bg-emerald-100 text-emerald-900"
+                    : artist.commissionStatus === "WAITLIST"
+                    ? "bg-amber-100 text-amber-900"
+                    : "bg-slate-100 text-slate-600"
+                }`}
+              >
+                {artist.commissionStatus === "OPEN"
+                  ? "🟢 COMISIONES ABIERTAS"
+                  : artist.commissionStatus === "WAITLIST"
+                  ? "🟡 LISTA DE ESPERA"
+                  : "🔴 COMISIONES CERRADAS"}
+              </span>
+
+              <button
+                type="button"
+                onClick={copyBioLink}
+                className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2 text-xs font-bold text-slate-700 hover:bg-slate-100"
+              >
+                {copied ? "✅ ¡Link copiado!" : "🔗 Compartir Puestito"}
+              </button>
             </div>
           </div>
 
-          {/* Redes Sociales */}
+          <p className="mt-4 max-w-3xl text-sm leading-relaxed text-slate-700">{artist.bio}</p>
+
+          {/* Links Sociales */}
           {artist.socialLinks && Object.keys(artist.socialLinks).length > 0 && (
-            <div className="flex items-center gap-3 self-end sm:self-center">
-              {Object.entries(artist.socialLinks).map(([key, url]: any) => (
-                <a
-                  key={key}
-                  href={url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-xs font-semibold uppercase bg-neutral-100 hover:bg-neutral-200 text-neutral-700 px-3 py-1.5 rounded-lg transition flex items-center gap-1"
-                >
-                  {key} <ExternalLink className="w-3 h-3" />
-                </a>
-              ))}
+            <div className="mt-4 flex flex-wrap gap-2">
+              {Object.entries(artist.socialLinks).map(([net, url]: any) =>
+                url ? (
+                  <a
+                    key={net}
+                    href={url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rounded-lg bg-slate-100 px-3 py-1 text-xs font-semibold capitalize text-slate-700 hover:bg-purple-100 hover:text-purple-800"
+                  >
+                    🌐 {net}
+                  </a>
+                ) : null
+              )}
             </div>
           )}
         </div>
 
-        {/* Bio y Términos */}
-        {artist.bio && (
-          <div className="mt-6 bg-white rounded-xl border border-neutral-200 p-6">
-            <h3 className="text-xs font-bold uppercase tracking-wider text-neutral-400 mb-2">Sobre el artista</h3>
-            <p className="text-neutral-700 leading-relaxed whitespace-pre-line text-sm sm:text-base">
-              {artist.bio}
-            </p>
-          </div>
-        )}
-
-        {/* Tabs de Navegación */}
-        <div className="mt-8 border-b border-neutral-200 flex items-center gap-8">
+        {/* Pestañas */}
+        <div className="flex border-t border-slate-200 bg-slate-50/60 px-6">
           <button
-            onClick={() => setTab("services")}
-            className={`pb-3 font-bold text-sm tracking-tight border-b-2 transition ${
-              tab === "services"
-                ? "border-purple-600 text-purple-600"
-                : "border-transparent text-neutral-500 hover:text-neutral-900"
+            type="button"
+            onClick={() => setActiveTab("services")}
+            className={`border-b-2 px-5 py-3.5 text-sm font-bold transition ${
+              activeTab === "services"
+                ? "border-purple-600 text-purple-700"
+                : "border-transparent text-slate-500 hover:text-slate-800"
             }`}
           >
-            Comisiones ({services.length})
+            🎨 Comisiones ({services.length})
           </button>
           <button
-            onClick={() => setTab("portfolio")}
-            className={`pb-3 font-bold text-sm tracking-tight border-b-2 transition ${
-              tab === "portfolio"
-                ? "border-purple-600 text-purple-600"
-                : "border-transparent text-neutral-500 hover:text-neutral-900"
+            type="button"
+            onClick={() => setActiveTab("portfolio")}
+            className={`border-b-2 px-5 py-3.5 text-sm font-bold transition ${
+              activeTab === "portfolio"
+                ? "border-purple-600 text-purple-700"
+                : "border-transparent text-slate-500 hover:text-slate-800"
             }`}
           >
-            Portfolio ({portfolio.length})
+            🖼️ Portfolio ({portfolio.length})
           </button>
           <button
-            onClick={() => setTab("reviews")}
-            className={`pb-3 font-bold text-sm tracking-tight border-b-2 transition ${
-              tab === "reviews"
-                ? "border-purple-600 text-purple-600"
-                : "border-transparent text-neutral-500 hover:text-neutral-900"
+            type="button"
+            onClick={() => setActiveTab("tos")}
+            className={`border-b-2 px-5 py-3.5 text-sm font-bold transition ${
+              activeTab === "tos"
+                ? "border-purple-600 text-purple-700"
+                : "border-transparent text-slate-500 hover:text-slate-800"
             }`}
           >
-            Reseñas ({reviews.length})
+            📜 Términos (ToS) y Reseñas ({reviews.length})
           </button>
         </div>
-
-        {/* Contenido de Tab: Comisiones */}
-        {tab === "services" && (
-          <div className="mt-8 space-y-6">
-            {services.length === 0 ? (
-              <p className="text-neutral-500 text-center py-12">El artista no tiene tipos de comisión creados aún.</p>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                {services.map((s: any) => (
-                  <div
-                    key={s.id}
-                    className="bg-white rounded-2xl border border-neutral-200 p-6 shadow-sm hover:shadow-md transition flex flex-col justify-between"
-                  >
-                    <div className="space-y-3">
-                      <div className="flex items-start justify-between gap-4">
-                        <h3 className="font-bold text-lg text-neutral-900">{s.title}</h3>
-                        <span className="text-xs bg-purple-50 text-purple-700 font-bold px-2 py-0.5 rounded-full shrink-0">
-                          {s.rating}
-                        </span>
-                      </div>
-                      <p className="text-sm text-neutral-600 leading-relaxed">{s.description}</p>
-                      
-                      <div className="flex flex-wrap items-center gap-4 text-xs text-neutral-500 pt-2">
-                        <span className="flex items-center gap-1">
-                          <Clock className="w-3.5 h-3.5" /> {s.turnaroundDays} días entrega
-                        </span>
-                        <span className="flex items-center gap-1">
-                          <Layers className="w-3.5 h-3.5" /> {s.revisionsIncluded} revisiones
-                        </span>
-                        <span className="flex items-center gap-1 font-semibold text-emerald-600">
-                          <ShieldCheck className="w-3.5 h-3.5" />{" "}
-                          {s.paymentPlan === "SPLIT_ON_SKETCH"
-                            ? "50% Seña / 50% al aprobar boceto"
-                            : s.paymentPlan === "SPLIT_ON_FINAL_PREVIEW"
-                            ? "50% Seña / 50% al ver preview final"
-                            : "100% al inicio"}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="pt-6 mt-6 border-t border-neutral-100 flex items-center justify-between">
-                      <div>
-                        <span className="text-[10px] text-neutral-400 block font-semibold uppercase">Precio</span>
-                        <span className="text-xl font-black text-neutral-900">
-                          ${s.priceArs.toLocaleString("es-AR")} ARS
-                        </span>
-                      </div>
-
-                      <Link
-                        href={`/u/${artist.username}/request/${s.id}`}
-                        className="inline-flex items-center gap-1.5 bg-neutral-900 hover:bg-neutral-800 text-white font-bold text-xs px-4 py-2.5 rounded-xl shadow transition"
-                      >
-                        Comisionar <ArrowRight className="w-3.5 h-3.5" />
-                      </Link>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Contenido de Tab: Portfolio */}
-        {tab === "portfolio" && (
-          <div className="mt-8">
-            {portfolio.length === 0 ? (
-              <p className="text-neutral-500 text-center py-12">No hay obras subidas al portfolio aún.</p>
-            ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6">
-                {portfolio.map((item: any) => (
-                  <div key={item.id} className="bg-white rounded-xl border border-neutral-200 overflow-hidden shadow-sm">
-                    <img
-                      src={item.imageUrl.startsWith("http") ? item.imageUrl : `http://localhost:4000${item.imageUrl}`}
-                      alt={item.title}
-                      className="w-full h-56 object-cover bg-neutral-100"
-                    />
-                    <div className="p-4">
-                      <h4 className="font-bold text-sm text-neutral-900">{item.title}</h4>
-                      {item.description && <p className="text-xs text-neutral-500 mt-1">{item.description}</p>}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Contenido de Tab: Reseñas */}
-        {tab === "reviews" && (
-          <div className="mt-8 space-y-4">
-            {reviews.length === 0 ? (
-              <p className="text-neutral-500 text-center py-12">El artista aún no tiene reseñas de comisiones completadas.</p>
-            ) : (
-              reviews.map((rev: any) => (
-                <div key={rev.id} className="bg-white p-5 rounded-xl border border-neutral-200 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className="font-bold text-sm text-neutral-800">{rev.buyerName}</span>
-                      <div className="flex text-amber-400">
-                        {Array.from({ length: rev.rating }).map((_, i) => (
-                          <Star key={i} className="w-3.5 h-3.5 fill-current" />
-                        ))}
-                      </div>
-                    </div>
-                    <span className="text-xs text-neutral-400">{new Date(rev.createdAt).toLocaleDateString()}</span>
-                  </div>
-                  <p className="text-sm text-neutral-600">{rev.comment}</p>
-                </div>
-              ))
-            )}
-          </div>
-        )}
       </div>
-    </div>
+
+      {/* Contenido de Pestaña 1: Comisiones */}
+      {activeTab === "services" && (
+        <section className="mt-6 grid gap-5 md:grid-cols-2">
+          {services.map((srv: any) => {
+            const tagsList: string[] = srv.tags || [];
+            const noSlots = srv.slotsAvailable === 0;
+
+            return (
+              <div
+                key={srv.id}
+                className="flex flex-col justify-between rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"
+              >
+                <div>
+                  <div className="flex items-start justify-between gap-2">
+                    <h2 className="text-lg font-extrabold text-slate-900">{srv.title}</h2>
+                    <span className="rounded-lg bg-purple-100 px-2.5 py-1 text-xs font-bold text-purple-800">
+                      {srv.rating}
+                    </span>
+                  </div>
+
+                  <p className="mt-2 text-sm leading-relaxed text-slate-600">{srv.description}</p>
+
+                  {/* Badges de Condiciones y Modalidad 50/50 */}
+                  <div className="mt-4 grid grid-cols-2 gap-2 rounded-xl bg-slate-50 p-3 text-xs">
+                    <div>
+                      <span className="text-slate-400">Modalidad de Pago:</span>
+                      <p className="font-bold text-purple-800">
+                        {srv.paymentPlan === "FULL_100"
+                          ? "💳 100% al aceptar"
+                          : srv.paymentPlan === "SPLIT_ON_SKETCH"
+                          ? "✨ 50% seña + 50% al aprobar Boceto"
+                          : "🛡️ 50% seña + 50% en Vista Previa Final"}
+                      </p>
+                    </div>
+                    <div>
+                      <span className="text-slate-400">Entrega estimada:</span>
+                      <p className="font-bold text-slate-800">
+                        ⏱️ {srv.turnaroundDays} días ({srv.revisionsIncluded} rev. incl.)
+                      </p>
+                      <p className="mt-0.5 text-slate-500">
+                        🎟️ Cupos libres: {srv.slotsAvailable}/{srv.maxSlots}
+                      </p>
+                    </div>
+                  </div>
+
+                  {tagsList.length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-1.5">
+                      {tagsList.map((t) => (
+                        <span
+                          key={t}
+                          className="rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] font-semibold text-slate-600"
+                        >
+                          #{t}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-6 flex items-center justify-between border-t border-slate-100 pt-4">
+                  <div>
+                    <p className="text-xl font-extrabold text-slate-900">
+                      ${srv.priceArs.toLocaleString("es-AR")} ARS
+                    </p>
+                    {srv.priceUsd && (
+                      <p className="text-xs font-medium text-slate-400">
+                        Ref. internacional: ~US${srv.priceUsd} USD
+                      </p>
+                    )}
+                  </div>
+
+                  {artist.commissionStatus !== "CLOSED" && !noSlots ? (
+                    <Link
+                      href={`/u/${artist.username}/request/${srv.id}`}
+                      className="rounded-xl bg-purple-600 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-purple-700"
+                    >
+                      ✨ Pedir Comisión
+                    </Link>
+                  ) : (
+                    <span className="rounded-xl bg-slate-100 px-4 py-2 text-xs font-bold text-slate-400">
+                      {noSlots ? "Sin cupos disponibles" : "Comisiones cerradas"}
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </section>
+      )}
+
+      {/* Contenido de Pestaña 2: Portfolio */}
+      {activeTab === "portfolio" && (
+        <section className="mt-6">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap gap-2">
+              {allPortfolioTags.map((tag) => (
+                <button
+                  key={tag}
+                  type="button"
+                  onClick={() => setSelectedPortfolioTag(tag)}
+                  className={`rounded-full px-3.5 py-1 text-xs font-semibold ${
+                    selectedPortfolioTag === tag
+                      ? "bg-purple-600 text-white"
+                      : "bg-white text-slate-700 border border-slate-200"
+                  }`}
+                >
+                  {tag}
+                </button>
+              ))}
+            </div>
+
+            <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600">
+              <input
+                type="checkbox"
+                checked={revealNsfw}
+                onChange={(e) => setRevealNsfw(e.target.checked)}
+                className="h-4 w-4 rounded text-purple-600"
+              />
+              <span>Desbloquear obras Suggestive / NSFW (+18)</span>
+            </label>
+          </div>
+
+          <div className="grid gap-5 sm:grid-cols-2 md:grid-cols-3">
+            {filteredPortfolio.map((item: any) => {
+              const isBlurred = item.hidden || (item.rating !== "SFW" && !revealNsfw);
+              return (
+                <div
+                  key={item.id}
+                  className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm"
+                >
+                  <div className="relative h-64 w-full overflow-hidden bg-slate-100">
+                    {item.imageUrl && (<img
+                      src={resolveImageUrl(item.imageUrl)}
+                      alt={item.title}
+                      loading="lazy"
+                      className={`h-full w-full object-cover transition duration-300 ${
+                        isBlurred ? "scale-110 blur-xl" : "hover:scale-105"
+                      }`}
+                    />)}
+                    {isBlurred && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/40 p-4 text-center text-white">
+                        <span className="rounded-full bg-rose-600 px-2.5 py-0.5 text-xs font-bold">
+                          {item.rating}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => (item.hidden ? enableAdultContent() : setRevealNsfw(true))}
+                          className="mt-2 rounded-lg bg-white px-3 py-1.5 text-xs font-bold text-slate-900 shadow"
+                        >
+                          {item.hidden ? "Soy +18: activar contenido adulto" : "Mostrar imagen"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="p-4">
+                    <h3 className="font-bold text-slate-900">{item.title}</h3>
+                    {item.description && (
+                      <p className="mt-1 text-xs text-slate-500">{item.description}</p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {/* Contenido de Pestaña 3: Términos y Reseñas */}
+      {activeTab === "tos" && (
+        <section className="mt-6 grid gap-6 md:grid-cols-2">
+          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+            <h2 className="text-lg font-extrabold text-slate-900">
+              📜 Términos de Servicio de @{artist.username}
+            </h2>
+            <p className="mt-1 text-xs text-slate-500">
+              Al encargar una comisión, aceptás este reglamento que queda guardado como respaldo en tu orden:
+            </p>
+            <div className="mt-4 whitespace-pre-line rounded-xl bg-slate-50 p-4 text-sm leading-relaxed text-slate-700">
+              {artist.termsOfService || "Términos estándar de la plataforma."}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+            <h2 className="text-lg font-extrabold text-slate-900">
+              ⭐ Reseñas de Compradores ({reviews.length})
+            </h2>
+            {reviews.length === 0 ? (
+              <p className="mt-4 text-sm text-slate-500">
+                Todavía no hay reseñas publicadas para este artista.
+              </p>
+            ) : (
+              <div className="mt-4 space-y-4">
+                {reviews.map((rev: any) => (
+                  <div key={rev.id} className="rounded-xl border border-slate-100 bg-slate-50 p-4">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-bold text-slate-900">{rev.buyerName}</span>
+                      <span className="text-sm font-bold text-amber-500">
+                        {"★".repeat(rev.rating)}
+                      </span>
+                    </div>
+                    <p className="mt-1.5 text-sm text-slate-700">{rev.comment}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+    </main>
   );
 }
 

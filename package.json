@@ -3,14 +3,16 @@
   "private": true,
   "scripts": {
     "dev": "pnpm --parallel --filter \"./apps/*\" dev",
-    "build": "pnpm --filter \"./packages/*\" build && pnpm --filter \"./apps/*\" build",
-    "lint": "pnpm --recursive lint",
+    "build": "pnpm --filter \"./packages/*\" --if-present build && pnpm --filter \"./apps/*\" build",
     "db:up": "docker compose up -d postgres",
     "db:down": "docker compose down",
-    "db:studio": "pnpm --filter @tupuestito/api db:studio"
+    "db:studio": "pnpm --filter @tupuestito/api db:studio",
+    "db:seed": "pnpm --filter @tupuestito/api db:seed",
+    "test:e2e": "pnpm --filter @tupuestito/api test:e2e",
+    "prod:up": "docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build",
+    "typecheck": "pnpm --filter @tupuestito/api typecheck && pnpm --filter @tupuestito/web exec tsc --noEmit"
   },
   "devDependencies": {
     "typescript": "^5.7.3"
   }
 }
-

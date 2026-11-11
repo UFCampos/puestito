@@ -1,472 +1,709 @@
-import { FastifyInstance } from "fastify";
-import crypto from "node:crypto";
+import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { MultipartFile } from "@fastify/multipart";
+import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { z } from "zod";
+import { alias } from "drizzle-orm/pg-core";
 import { db } from "../db/index.js";
 import {
+  artistProfiles,
+  commissionAddons,
   commissionOrders,
   commissionServices,
-  artistProfiles,
-  orderMilestonePayments,
   orderMessages,
-  paymentAccounts,
-  users,
-  reviews
+  orderMilestonePayments,
+  reviews,
+  users
 } from "../db/schema.js";
-import { eq, and, or, desc } from "drizzle-orm";
-import { MercadoPagoService } from "../services/mercadopago.service.js";
+import { config } from "../config.js";
+import { HttpError, parseBody, requireUser, type SessionUser } from "../lib/http.js";
+import { MAX_REFERENCE_BYTES, extensionFor, newKey, storage } from "../services/storage.service.js";
 import { WatermarkService } from "../services/watermark.service.js";
+import { MercadoPagoService, MercadoPagoError } from "../services/mercadopago.service.js";
+import { notifyDiscord } from "../services/notification.service.js";
+import { loadAvatar } from "./artist.routes.js";
+import {
+  PLAN_LABEL,
+  SLOT_STATUSES,
+  addSystemMessage,
+  computeAmounts,
+  expectedStage,
+  getArtistMpToken,
+  milestoneFee,
+  neutralTitle,
+  nextOrderNumber,
+  notifyOrder,
+  transition,
+  type Order
+} from "../services/order.service.js";
+
+const MAX_DELIVERY_BYTES = 200 * 1024 * 1024;
+
+/** Carga el pedido y determina el rol del usuario; 404 si no participa (no revela existencia) */
+async function loadOrderFor(request: FastifyRequest, user: SessionUser) {
+  const { id } = request.params as { id: string };
+  if (!/^[0-9a-f-]{36}$/i.test(id)) throw new HttpError(404, "Pedido no encontrado");
+  const [row] = await db
+    .select({ order: commissionOrders, artistUserId: artistProfiles.userId, artistProfile: artistProfiles })
+    .from(commissionOrders)
+    .innerJoin(artistProfiles, eq(commissionOrders.artistId, artistProfiles.id))
+    .where(eq(commissionOrders.id, id))
+    .limit(1);
+  if (!row) throw new HttpError(404, "Pedido no encontrado");
+  const isBuyer = row.order.buyerId === user.id;
+  const isArtist = row.artistUserId === user.id;
+  const isAdmin = user.role === "ADMIN";
+  if (!isBuyer && !isArtist && !isAdmin) throw new HttpError(404, "Pedido no encontrado");
+  return { order: row.order, artistProfile: row.artistProfile, isBuyer, isArtist, isAdmin };
+}
+
+function assertStatus(order: Order, ...allowed: Order["status"][]) {
+  if (!allowed.includes(order.status)) {
+    throw new HttpError(409, "Esta acción no está disponible en el estado actual del pedido");
+  }
+}
+
+function multipartField(file: MultipartFile, name: string): string | undefined {
+  const f = (file.fields as Record<string, { value?: unknown } | undefined>)[name];
+  return typeof f?.value === "string" ? f.value : undefined;
+}
+
+async function signAll(keys: string[]): Promise<string[]> {
+  return Promise.all(keys.map((k) => storage.signedGetUrl(k)));
+}
 
 export async function orderRoutes(fastify: FastifyInstance) {
-  // POST /api/orders — Crear nueva solicitud de comisión (Comprador)
-  fastify.post("/", async (request, reply) => {
-    const decoded = (await request.jwtVerify()) as any;
-    const { serviceId, buyerBrief, referenceImages, externalBoardUrl } = request.body as any;
+  // ───────────────────────────────────────────────────────────
+  // POST /api/orders — Crear solicitud (Plan §6)
+  // ───────────────────────────────────────────────────────────
+  fastify.post("/", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request) => {
+    const user = await requireUser(request);
+    const body = parseBody(
+      z.object({
+        serviceId: z.string().uuid(),
+        addonIds: z.array(z.string().uuid()).max(10).default([]),
+        buyerBrief: z.string().trim().min(10, "Contale al artista un poco más sobre tu pedido").max(8000),
+        referenceKeys: z.array(z.string()).max(10, "Máximo 10 imágenes de referencia").default([]),
+        externalBoardUrl: z
+          .string()
+          .trim()
+          .max(1000)
+          .url("Link inválido")
+          .refine((u) => u.startsWith("https://"), "El link al tablero debe empezar con https://")
+          .optional()
+          .or(z.literal("").transform(() => undefined)),
+        acceptedTerms: z.literal(true, {
+          errorMap: () => ({ message: "Tenés que aceptar los Términos del artista y la modalidad de pago" })
+        })
+      }),
+      request.body
+    );
 
-    if (!serviceId || !buyerBrief) {
-      return reply.status(400).send({ error: "Servicio y descripción requeridos" });
-    }
+    const [row] = await db
+      .select({ service: commissionServices, profile: artistProfiles, artistUser: users })
+      .from(commissionServices)
+      .innerJoin(artistProfiles, eq(commissionServices.artistId, artistProfiles.id))
+      .innerJoin(users, eq(artistProfiles.userId, users.id))
+      .where(and(eq(commissionServices.id, body.serviceId), eq(commissionServices.isActive, true)))
+      .limit(1);
+    if (!row) throw new HttpError(404, "Servicio de comisión no encontrado");
+    const { service, profile, artistUser } = row;
 
-    const service = db.select().from(commissionServices).where(eq(commissionServices.id, serviceId)).get();
-    if (!service) {
-      return reply.status(404).send({ error: "Servicio de comisión no encontrado" });
-    }
+    if (artistUser.id === user.id) throw new HttpError(400, "No podés encargarte una comisión a vos mismo/a");
+    if (profile.commissionStatus === "CLOSED") throw new HttpError(409, "El artista tiene las comisiones cerradas");
 
-    const artist = db.select().from(artistProfiles).where(eq(artistProfiles.id, service.artistId)).get();
-    if (!artist) {
-      return reply.status(404).send({ error: "Artista no encontrado" });
-    }
+    // Precio calculado SIEMPRE en el servidor a partir de los addons reales
+    const addons = body.addonIds.length
+      ? await db
+          .select()
+          .from(commissionAddons)
+          .where(
+            and(
+              inArray(commissionAddons.id, body.addonIds),
+              eq(commissionAddons.serviceId, service.id),
+              eq(commissionAddons.isActive, true)
+            )
+          )
+      : [];
+    if (addons.length !== new Set(body.addonIds).size) throw new HttpError(400, "Algún extra seleccionado ya no está disponible");
 
-    const orderId = crypto.randomUUID();
-    const orderNumber = `PST-${Math.floor(1000 + Math.random() * 9000)}`;
-    const now = new Date().toISOString();
-
-    const totalAmount = service.priceArs;
-    const platformFeeAmount = Math.round(totalAmount * 0.05); // 5%
-
-    // Desglose según paymentPlan
-    let depositAmount = totalAmount;
-    let finalAmount = 0;
-    if (service.paymentPlan === "SPLIT_ON_SKETCH" || service.paymentPlan === "SPLIT_ON_FINAL_PREVIEW") {
-      depositAmount = Math.round(totalAmount * 0.5);
-      finalAmount = totalAmount - depositAmount;
-    }
-
-    db.insert(commissionOrders)
-      .values({
-        id: orderId,
-        orderNumber,
-        buyerId: decoded.id,
-        artistId: artist.id,
-        serviceId: service.id,
-        status: "REQUESTED",
-        paymentPlanSnapshot: service.paymentPlan,
-        termsSnapshot: artist.termsOfService || "Términos estándar de TuPuestito",
-        termsAcceptedAt: now,
-        currency: "ARS",
-        totalAmount,
-        platformFeeAmount,
-        depositAmount,
-        finalAmount,
-        buyerBrief,
-        referenceImages: JSON.stringify(referenceImages || []),
-        externalBoardUrl: externalBoardUrl || null,
-        createdAt: now
-      })
-      .run();
-
-    // Mensaje inicial del sistema en el hilo
-    db.insert(orderMessages)
-      .values({
-        id: crypto.randomUUID(),
-        orderId,
-        senderId: decoded.id,
-        type: "SYSTEM_EVENT",
-        content: `Solicitud #${orderNumber} enviada por el comprador. Esperando que el artista acepte el pedido.`,
-        createdAt: now
-      })
-      .run();
-
-    return { id: orderId, orderNumber };
-  });
-
-  // GET /api/orders — Listar pedidos del usuario autenticado (como comprador o artista)
-  fastify.get("/", async (request) => {
-    const decoded = (await request.jwtVerify()) as any;
-    const userProfile = db.select().from(artistProfiles).where(eq(artistProfiles.userId, decoded.id)).get();
-
-    let orders;
-    if (userProfile) {
-      orders = db
-        .select()
-        .from(commissionOrders)
-        .where(or(eq(commissionOrders.buyerId, decoded.id), eq(commissionOrders.artistId, userProfile.id)))
-        .orderBy(desc(commissionOrders.createdAt))
-        .all();
-    } else {
-      orders = db
-        .select()
-        .from(commissionOrders)
-        .where(eq(commissionOrders.buyerId, decoded.id))
-        .orderBy(desc(commissionOrders.createdAt))
-        .all();
-    }
-
-    return { orders };
-  });
-
-  // GET /api/orders/:id — Detalle completo de la sala del pedido
-  fastify.get("/:id", async (request, reply) => {
-    const decoded = (await request.jwtVerify()) as any;
-    const { id } = request.params as any;
-
-    const order = db.select().from(commissionOrders).where(eq(commissionOrders.id, id)).get();
-    if (!order) {
-      return reply.status(404).send({ error: "Pedido no encontrado" });
-    }
-
-    const artistProfile = db.select().from(artistProfiles).where(eq(artistProfiles.id, order.artistId)).get();
-    const isBuyer = order.buyerId === decoded.id;
-    const isArtist = artistProfile?.userId === decoded.id;
-
-    if (!isBuyer && !isArtist && decoded.role !== "ADMIN") {
-      return reply.status(403).send({ error: "No tenés acceso a este pedido" });
-    }
-
-    const service = db.select().from(commissionServices).where(eq(commissionServices.id, order.serviceId)).get();
-    const buyer = db.select().from(users).where(eq(users.id, order.buyerId)).get();
-    const artistUser = artistProfile ? db.select().from(users).where(eq(users.id, artistProfile.userId)).get() : null;
-
-    const messages = db
-      .select({
-        id: orderMessages.id,
-        type: orderMessages.type,
-        content: orderMessages.content,
-        attachments: orderMessages.attachments,
-        createdAt: orderMessages.createdAt,
-        senderId: orderMessages.senderId,
-        senderName: users.displayName,
-        senderAvatar: users.avatarUrl
-      })
-      .from(orderMessages)
-      .innerJoin(users, eq(orderMessages.senderId, users.id))
-      .where(eq(orderMessages.orderId, id))
-      .orderBy(orderMessages.createdAt)
-      .all();
-
-    const payments = db
-      .select()
-      .from(orderMilestonePayments)
-      .where(eq(orderMilestonePayments.orderId, id))
-      .all();
-
-    const review = db.select().from(reviews).where(eq(reviews.orderId, id)).get();
-
-    return {
-      order,
-      service,
-      buyer: { id: buyer?.id, displayName: buyer?.displayName, username: buyer?.username },
-      artist: { id: artistProfile?.id, displayName: artistUser?.displayName, username: artistUser?.username },
-      isBuyer,
-      isArtist,
-      messages,
-      payments,
-      review
-    };
-  });
-
-  // POST /api/orders/:id/accept — Artista acepta pedido
-  fastify.post("/:id/accept", async (request, reply) => {
-    const decoded = (await request.jwtVerify()) as any;
-    const { id } = request.params as any;
-
-    const order = db.select().from(commissionOrders).where(eq(commissionOrders.id, id)).get();
-    if (!order) return reply.status(404).send({ error: "Pedido no encontrado" });
-
-    const artistProfile = db.select().from(artistProfiles).where(eq(artistProfiles.id, order.artistId)).get();
-    if (artistProfile?.userId !== decoded.id) {
-      return reply.status(403).send({ error: "Solo el artista puede aceptar este pedido" });
-    }
-
-    db.update(commissionOrders)
-      .set({ status: "ACCEPTED_WAITING_DEPOSIT" })
-      .where(eq(commissionOrders.id, id))
-      .run();
-
-    db.insert(orderMessages)
-      .values({
-        id: crypto.randomUUID(),
-        orderId: id,
-        senderId: decoded.id,
-        type: "SYSTEM_EVENT",
-        content: "El artista aceptó la comisión. El comprador ahora puede abonar la seña para comenzar.",
-        createdAt: new Date().toISOString()
-      })
-      .run();
-
-    return { ok: true, status: "ACCEPTED_WAITING_DEPOSIT" };
-  });
-
-  // POST /api/orders/:id/checkout — Iniciar pago de hito (Seña o Pago Final)
-  fastify.post("/:id/checkout", async (request, reply) => {
-    const decoded = (await request.jwtVerify()) as any;
-    const { id } = request.params as any;
-    const { stage } = request.body as any; // "DEPOSIT_50", "FINAL_50", "FULL_100"
-
-    const order = db.select().from(commissionOrders).where(eq(commissionOrders.id, id)).get();
-    if (!order) return reply.status(404).send({ error: "Pedido no encontrado" });
-    if (order.buyerId !== decoded.id) {
-      return reply.status(403).send({ error: "Solo el comprador puede abonar" });
-    }
-
-    const artistAccount = db
-      .select()
-      .from(paymentAccounts)
-      .where(and(eq(paymentAccounts.artistId, order.artistId), eq(paymentAccounts.isActive, true)))
-      .get();
-
-    let decryptedToken = "";
-    if (artistAccount) {
-      try {
-        decryptedToken = MercadoPagoService.decryptToken(artistAccount.accessTokenEnc);
-      } catch (err) {
-        console.warn("Token no descifrable, usando modo sandbox:", err);
+    // Referencias: deben ser subidas por este usuario, existir y respetar tipo/tamaño
+    const refPrefix = `refs/${user.id}/`;
+    const refs = [...new Set(body.referenceKeys)];
+    for (const key of refs) {
+      if (!key.startsWith(refPrefix) || key.includes("..")) throw new HttpError(400, "Referencia inválida");
+      const head = await storage.head("private", key);
+      if (!head) throw new HttpError(400, "Alguna referencia no terminó de subirse. Volvé a intentarlo.");
+      if (head.size > MAX_REFERENCE_BYTES || !["image/png", "image/jpeg", "image/webp"].includes(head.contentType)) {
+        throw new HttpError(400, "Las referencias deben ser PNG, JPG o WebP de hasta 5 MB");
       }
     }
 
-    const isFull = order.paymentPlanSnapshot === "FULL_100";
-    const amount = stage === "FINAL_50" ? order.finalAmount : order.depositAmount;
-    const fee = Math.round(amount * 0.05);
+    const totalAmount = service.priceArs + addons.reduce((acc, a) => acc + a.priceArs, 0);
+    const amounts = computeAmounts(service.paymentPlan, totalAmount);
+    const termsSnapshot = [
+      `Términos de Servicio de @${artistUser.username}:`,
+      profile.termsOfService?.trim() || "(El artista no publicó términos propios; aplican los Términos de TuPuestito.)",
+      "",
+      `Modalidad de pago aceptada: ${PLAN_LABEL[service.paymentPlan]}.`,
+      "El comprador entiende que la seña inicial no es reembolsable una vez entregado el boceto."
+    ].join("\n");
 
-    const preference = await MercadoPagoService.createSplitPreference({
-      orderId: order.id,
-      orderNumber: order.orderNumber,
-      title: `Ilustración ${order.orderNumber} (${stage === "FINAL_50" ? "Pago Final" : "Seña"})`,
-      unitPriceArs: amount,
-      marketplaceFeeArs: fee,
-      artistAccessToken: decryptedToken,
-      notificationUrl: "http://localhost:4000/api/payments/webhook"
+    const order = await db.transaction(async (tx) => {
+      const orderNumber = await nextOrderNumber(tx);
+      const [created] = await tx
+        .insert(commissionOrders)
+        .values({
+          orderNumber,
+          buyerId: user.id,
+          artistId: profile.id,
+          serviceId: service.id,
+          status: "REQUESTED",
+          paymentPlanSnapshot: service.paymentPlan,
+          termsSnapshot,
+          termsAcceptedAt: new Date(),
+          serviceSnapshot: {
+            title: service.title,
+            priceArs: service.priceArs,
+            turnaroundDays: service.turnaroundDays,
+            revisionsIncluded: service.revisionsIncluded,
+            rating: service.rating
+          },
+          addonsSnapshot: addons.map((a) => ({ id: a.id, name: a.name, priceArs: a.priceArs })),
+          currency: "ARS",
+          totalAmount,
+          ...amounts,
+          buyerBrief: body.buyerBrief,
+          referenceImages: refs,
+          externalBoardUrl: body.externalBoardUrl ?? null
+        })
+        .returning();
+      await addSystemMessage(
+        tx,
+        created!.id,
+        `📝 Solicitud #${orderNumber} enviada con ${refs.length} referencia(s). Modalidad pactada: ${PLAN_LABEL[service.paymentPlan]}. Esperando que el artista acepte el pedido.`
+      );
+      return created!;
     });
 
-    const paymentId = crypto.randomUUID();
-    db.insert(orderMilestonePayments)
-      .values({
-        id: paymentId,
-        orderId: order.id,
-        stage: stage || (isFull ? "FULL_100" : "DEPOSIT_50"),
-        provider: "MERCADOPAGO",
-        grossAmount: amount,
-        marketplaceFee: fee,
-        mpPreferenceId: preference.id,
-        status: "PENDING",
-        createdAt: new Date().toISOString()
+    void notifyOrder(order, "artist", "Nueva solicitud de comisión", `@${user.username} te pidió "${service.title}". Revisá el brief y aceptá o rechazá la solicitud.`);
+    void notifyDiscord(`📝 Nueva solicitud #${order.orderNumber}: @${user.username} → @${artistUser.username} ($${totalAmount} ARS)`);
+    return { id: order.id, orderNumber: order.orderNumber };
+  });
+
+  // ───────────────────────────────────────────────────────────
+  // GET /api/orders — pedidos como comprador y como artista
+  // ───────────────────────────────────────────────────────────
+  fastify.get("/", async (request) => {
+    const user = await requireUser(request);
+    const [profile] = await db.select({ id: artistProfiles.id }).from(artistProfiles).where(eq(artistProfiles.userId, user.id)).limit(1);
+    const buyer = alias(users, "buyer");
+    const rows = await db
+      .select({
+        order: commissionOrders,
+        buyerName: buyer.name,
+        buyerUsername: buyer.username,
+        artistName: users.name,
+        artistUsername: users.username
       })
-      .run();
+      .from(commissionOrders)
+      .innerJoin(buyer, eq(commissionOrders.buyerId, buyer.id))
+      .innerJoin(artistProfiles, eq(commissionOrders.artistId, artistProfiles.id))
+      .innerJoin(users, eq(artistProfiles.userId, users.id))
+      .where(
+        profile
+          ? or(eq(commissionOrders.buyerId, user.id), eq(commissionOrders.artistId, profile.id))
+          : eq(commissionOrders.buyerId, user.id)
+      )
+      .orderBy(desc(commissionOrders.updatedAt))
+      .limit(200);
 
     return {
-      initPoint: preference.initPoint,
-      paymentId
+      orders: rows.map((r) => ({
+        id: r.order.id,
+        orderNumber: r.order.orderNumber,
+        status: r.order.status,
+        paymentPlanSnapshot: r.order.paymentPlanSnapshot,
+        totalAmount: r.order.totalAmount,
+        currency: r.order.currency,
+        buyerBrief: r.order.buyerBrief,
+        createdAt: r.order.createdAt,
+        updatedAt: r.order.updatedAt,
+        serviceTitle: r.order.serviceSnapshot.title,
+        buyerName: r.buyerName,
+        buyerUsername: r.buyerUsername,
+        artistName: r.artistName,
+        artistUsername: r.artistUsername,
+        role: r.order.buyerId === user.id ? "BUYER" : "ARTIST"
+      }))
     };
   });
 
-  // POST /api/orders/:id/messages — Enviar mensaje en el hilo del pedido
-  fastify.post("/:id/messages", async (request, reply) => {
-    const decoded = (await request.jwtVerify()) as any;
-    const { id } = request.params as any;
-    const { content, type, attachments } = request.body as any;
+  // ───────────────────────────────────────────────────────────
+  // GET /api/orders/:id — sala del pedido
+  // ───────────────────────────────────────────────────────────
+  fastify.get("/:id", async (request) => {
+    const user = await requireUser(request);
+    const { order, artistProfile, isBuyer, isArtist } = await loadOrderFor(request, user);
 
-    if (!content && !attachments) {
-      return reply.status(400).send({ error: "Contenido requerido" });
-    }
+    const [buyer] = await db
+      .select({ id: users.id, displayName: users.name, username: users.username, avatarUrl: users.image })
+      .from(users)
+      .where(eq(users.id, order.buyerId));
+    const [artistUser] = await db
+      .select({ displayName: users.name, username: users.username, avatarUrl: users.image })
+      .from(users)
+      .where(eq(users.id, artistProfile.userId));
 
-    const messageId = crypto.randomUUID();
-    db.insert(orderMessages)
-      .values({
-        id: messageId,
-        orderId: id,
-        senderId: decoded.id,
-        type: type || "TEXT",
-        content: content || "",
-        attachments: attachments ? JSON.stringify(attachments) : null,
-        createdAt: new Date().toISOString()
-      })
-      .run();
+    const [messages, payments, [review]] = await Promise.all([
+      db
+        .select({
+          id: orderMessages.id,
+          type: orderMessages.type,
+          content: orderMessages.content,
+          attachments: orderMessages.attachments,
+          createdAt: orderMessages.createdAt,
+          senderId: orderMessages.senderId,
+          senderName: users.name,
+          senderAvatar: users.image
+        })
+        .from(orderMessages)
+        .leftJoin(users, eq(orderMessages.senderId, users.id))
+        .where(eq(orderMessages.orderId, order.id))
+        .orderBy(asc(orderMessages.createdAt))
+        .limit(500),
+      db
+        .select({
+          id: orderMilestonePayments.id,
+          stage: orderMilestonePayments.stage,
+          grossAmount: orderMilestonePayments.grossAmount,
+          marketplaceFee: orderMilestonePayments.marketplaceFee,
+          status: orderMilestonePayments.status,
+          paidAt: orderMilestonePayments.paidAt,
+          mpPaymentId: orderMilestonePayments.mpPaymentId
+        })
+        .from(orderMilestonePayments)
+        .where(eq(orderMilestonePayments.orderId, order.id))
+        .orderBy(asc(orderMilestonePayments.createdAt)),
+      db.select().from(reviews).where(eq(reviews.orderId, order.id)).limit(1)
+    ]);
 
-    return { id: messageId, ok: true };
+    // URLs firmadas de vida corta: nada del pedido es público (Plan §2 y §3)
+    const signedMessages = await Promise.all(
+      messages.map(async (m) => ({ ...m, attachments: await signAll(m.attachments) }))
+    );
+    const hdUnlocked = order.status === "COMPLETED_HD_UNLOCKED";
+
+    const { finalHdPrivateKey, sketchWatermarkedKey, previewWatermarkedKey, referenceImages, ...rest } = order;
+    return {
+      order: {
+        ...rest,
+        referenceImages: await signAll(referenceImages),
+        sketchWatermarkedUrl: sketchWatermarkedKey ? await storage.signedGetUrl(sketchWatermarkedKey) : null,
+        previewWatermarkedUrl: previewWatermarkedKey ? await storage.signedGetUrl(previewWatermarkedKey) : null,
+        hasFinalHd: Boolean(finalHdPrivateKey),
+        hdUnlocked
+      },
+      nextPaymentStage: expectedStage(order),
+      depositExpiresAt:
+        order.status === "ACCEPTED_WAITING_DEPOSIT" && order.acceptedAt
+          ? new Date(order.acceptedAt.getTime() + config.DEPOSIT_EXPIRATION_HOURS * 3600_000)
+          : null,
+      buyer,
+      artist: { id: artistProfile.id, ...artistUser, defaultWatermarkMode: artistProfile.defaultWatermarkMode },
+      isBuyer,
+      isArtist,
+      currentUserId: user.id,
+      messages: signedMessages,
+      payments,
+      review: review ?? null
+    };
   });
 
-  // POST /api/orders/:id/sketch — Artista sube boceto (con marca de agua)
-  fastify.post("/:id/sketch", async (request, reply) => {
-    const decoded = (await request.jwtVerify()) as any;
-    const { id } = request.params as any;
+  // ───────────────────────────────────────────────────────────
+  // Artista acepta / rechaza; comprador o artista cancelan antes de pagar
+  // ───────────────────────────────────────────────────────────
+  fastify.post("/:id/accept", async (request) => {
+    const user = await requireUser(request);
+    const { order, isArtist } = await loadOrderFor(request, user);
+    if (!isArtist) throw new HttpError(403, "Solo el artista puede aceptar este pedido");
+    assertStatus(order, "REQUESTED");
 
-    const order = db.select().from(commissionOrders).where(eq(commissionOrders.id, id)).get();
-    if (!order) return reply.status(404).send({ error: "Pedido no encontrado" });
+    const updated = await db.transaction(async (tx) => {
+      // Cupos: bloqueamos el servicio para contar sin carreras
+      const [service] = await tx.select().from(commissionServices).where(eq(commissionServices.id, order.serviceId)).for("update");
+      const [{ n }] = (await tx
+        .select({ n: sql<number>`count(*)::int` })
+        .from(commissionOrders)
+        .where(and(eq(commissionOrders.serviceId, order.serviceId), inArray(commissionOrders.status, SLOT_STATUSES)))) as [{ n: number }];
+      if (service && n >= service.maxSlots) {
+        throw new HttpError(409, `Ya tenés ${n}/${service.maxSlots} cupos ocupados para este servicio. Terminá un pedido o ampliá los cupos.`);
+      }
+      const o = await transition(tx, order.id, "REQUESTED", "ACCEPTED_WAITING_DEPOSIT", { acceptedAt: new Date() });
+      await addSystemMessage(
+        tx,
+        order.id,
+        `✅ El artista aceptó la comisión. El comprador tiene ${config.DEPOSIT_EXPIRATION_HOURS} hs para abonar el primer pago.`
+      );
+      return o;
+    });
+    void notifyOrder(updated, "buyer", "¡Tu comisión fue aceptada!", `Aboná el pago inicial dentro de las ${config.DEPOSIT_EXPIRATION_HOURS} hs para que el artista empiece.`);
+    return { ok: true, status: updated.status };
+  });
 
-    const artistProfile = db.select().from(artistProfiles).where(eq(artistProfiles.id, order.artistId)).get();
-    if (artistProfile?.userId !== decoded.id) {
-      return reply.status(403).send({ error: "Solo el artista puede subir bocetos" });
+  fastify.post("/:id/reject", async (request) => {
+    const user = await requireUser(request);
+    const { order, isArtist } = await loadOrderFor(request, user);
+    if (!isArtist) throw new HttpError(403, "Solo el artista puede rechazar este pedido");
+    const { reason } = parseBody(z.object({ reason: z.string().trim().max(1000).optional() }), request.body);
+    assertStatus(order, "REQUESTED");
+    const updated = await db.transaction(async (tx) => {
+      const o = await transition(tx, order.id, "REQUESTED", "REJECTED");
+      await addSystemMessage(tx, order.id, `❌ El artista rechazó la solicitud (sin cobro).${reason ? ` Motivo: "${reason}"` : ""}`);
+      return o;
+    });
+    void notifyOrder(updated, "buyer", "Solicitud rechazada", reason ? `El artista no puede tomar tu pedido: ${reason}` : "El artista no puede tomar tu pedido en este momento. No se realizó ningún cobro.");
+    return { ok: true, status: updated.status };
+  });
+
+  fastify.post("/:id/cancel", async (request) => {
+    const user = await requireUser(request);
+    const { order, isArtist, isBuyer } = await loadOrderFor(request, user);
+    if (!isArtist && !isBuyer) throw new HttpError(403, "No autorizado");
+    // Una vez acreditado un pago, la cancelación/reembolso pasa por soporte
+    assertStatus(order, "REQUESTED", "ACCEPTED_WAITING_DEPOSIT");
+    const updated = await db.transaction(async (tx) => {
+      const o = await transition(tx, order.id, ["REQUESTED", "ACCEPTED_WAITING_DEPOSIT"], "CANCELLED");
+      await tx
+        .update(orderMilestonePayments)
+        .set({ status: "REJECTED" })
+        .where(and(eq(orderMilestonePayments.orderId, order.id), eq(orderMilestonePayments.status, "PENDING")));
+      await addSystemMessage(tx, order.id, `🚫 El pedido fue cancelado por ${isArtist ? "el artista" : "el comprador"} antes de cualquier pago.`);
+      return o;
+    });
+    void notifyOrder(updated, isArtist ? "buyer" : "artist", "Pedido cancelado", `El pedido fue cancelado por ${isArtist ? "el artista" : "el comprador"}.`);
+    return { ok: true, status: updated.status };
+  });
+
+  // ───────────────────────────────────────────────────────────
+  // POST /api/orders/:id/checkout — preferencia de Mercado Pago del hito actual
+  // ───────────────────────────────────────────────────────────
+  fastify.post("/:id/checkout", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request) => {
+    const user = await requireUser(request);
+    const { order, isBuyer } = await loadOrderFor(request, user);
+    if (!isBuyer) throw new HttpError(403, "Solo el comprador puede abonar");
+    const stage = expectedStage(order);
+    if (!stage) throw new HttpError(409, "No hay ningún pago pendiente en este momento");
+
+    const amount = stage === "FINAL_50" ? order.finalAmount : order.depositAmount;
+    const fee = milestoneFee(order, stage);
+
+    const [existing] = await db
+      .select()
+      .from(orderMilestonePayments)
+      .where(and(eq(orderMilestonePayments.orderId, order.id), eq(orderMilestonePayments.stage, stage)))
+      .limit(1);
+    if (existing?.status === "APPROVED") throw new HttpError(409, "Este pago ya fue acreditado");
+
+    const [milestone] = existing
+      ? await db
+          .update(orderMilestonePayments)
+          .set({ status: "PENDING", grossAmount: amount, marketplaceFee: fee })
+          .where(eq(orderMilestonePayments.id, existing.id))
+          .returning()
+      : await db
+          .insert(orderMilestonePayments)
+          .values({ orderId: order.id, stage, provider: "MERCADOPAGO", grossAmount: amount, marketplaceFee: fee })
+          .returning();
+
+    if (config.PAYMENTS_MODE === "mock") {
+      const url = `${config.API_URL}/api/payments/mock-checkout?milestone=${milestone!.id}`;
+      await db.update(orderMilestonePayments).set({ checkoutUrl: url, mpPreferenceId: `mock_${milestone!.id}` }).where(eq(orderMilestonePayments.id, milestone!.id));
+      return { initPoint: url, milestoneId: milestone!.id };
     }
 
-    const data = await request.file();
-    if (!data) return reply.status(400).send({ error: "Archivo requerido" });
+    const mp = await getArtistMpToken(order.artistId);
+    if (!mp) throw new HttpError(409, "El artista todavía no vinculó su cuenta de Mercado Pago. Avisale por el chat del pedido.");
 
-    const buffer = await data.toBuffer();
-    const watermarkMode = (artistProfile?.defaultWatermarkMode as any) || "AUTO_TEXT";
-    const customText = artistProfile?.watermarkCustomText || "TuPuestito • BOCETO";
+    const [artistUser] = await db
+      .select({ username: users.username })
+      .from(artistProfiles)
+      .innerJoin(users, eq(artistProfiles.userId, users.id))
+      .where(eq(artistProfiles.id, order.artistId));
 
-    const watermarked = await WatermarkService.processImage(buffer, {
-      mode: watermarkMode,
-      customText: customText
+    try {
+      const preference = await MercadoPagoService.createPreference({
+        sellerAccessToken: mp.token,
+        milestoneId: milestone!.id,
+        orderId: order.id,
+        title: neutralTitle(order.orderNumber, artistUser?.username ?? "artista", stage),
+        amountArs: amount,
+        marketplaceFeeArs: fee,
+        payerEmail: user.email,
+        expiresAt:
+          stage !== "FINAL_50" && order.acceptedAt
+            ? new Date(order.acceptedAt.getTime() + config.DEPOSIT_EXPIRATION_HOURS * 3600_000)
+            : undefined
+      });
+      const initPoint = mp.liveMode ? preference.init_point : preference.sandbox_init_point || preference.init_point;
+      await db
+        .update(orderMilestonePayments)
+        .set({ mpPreferenceId: preference.id, checkoutUrl: initPoint })
+        .where(eq(orderMilestonePayments.id, milestone!.id));
+      return { initPoint, milestoneId: milestone!.id };
+    } catch (err) {
+      request.log.error({ err }, "Error creando preferencia de Mercado Pago");
+      if (err instanceof MercadoPagoError && err.status === 401) {
+        throw new HttpError(502, "La vinculación de Mercado Pago del artista venció. Pedile que la reconecte.");
+      }
+      throw new HttpError(502, "Mercado Pago no respondió. Probá de nuevo en unos minutos.");
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────
+  // POST /api/orders/:id/messages — hilo privado
+  // ───────────────────────────────────────────────────────────
+  fastify.post("/:id/messages", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request) => {
+    const user = await requireUser(request);
+    const { order, isBuyer, isArtist } = await loadOrderFor(request, user);
+    if (!isBuyer && !isArtist) throw new HttpError(403, "Solo los participantes pueden escribir");
+    if (["REJECTED", "EXPIRED", "CANCELLED"].includes(order.status)) {
+      throw new HttpError(409, "El hilo de este pedido está cerrado");
+    }
+    const { content } = parseBody(z.object({ content: z.string().trim().min(1).max(4000) }), request.body);
+    const [msg] = await db.insert(orderMessages).values({ orderId: order.id, senderId: user.id, type: "TEXT", content }).returning({ id: orderMessages.id });
+    return { id: msg!.id, ok: true };
+  });
+
+  // ───────────────────────────────────────────────────────────
+  // POST /api/orders/:id/sketch — artista sube boceto (marca de agua)
+  // ───────────────────────────────────────────────────────────
+  fastify.post("/:id/sketch", async (request) => {
+    const user = await requireUser(request);
+    const { order, artistProfile, isArtist } = await loadOrderFor(request, user);
+    if (!isArtist) throw new HttpError(403, "Solo el artista puede subir bocetos");
+    assertStatus(order, "IN_PROGRESS_SKETCH");
+
+    const file = await request.file({ limits: { fileSize: 30 * 1024 * 1024 } });
+    if (!file) throw new HttpError(400, "Archivo requerido");
+    const buffer = await file.toBuffer();
+    if (file.file.truncated) throw new HttpError(413, "El boceto supera los 30 MB");
+    await WatermarkService.assertImage(buffer).catch((e: Error) => {
+      throw new HttpError(400, e.message);
     });
+    const mode = z.enum(["MANUAL", "AUTO_TEXT", "AUTO_AVATAR"]).catch(artistProfile.defaultWatermarkMode).parse(multipartField(file, "watermarkMode"));
 
-    const sketchUrl = await WatermarkService.saveUpload(watermarked, "webp");
+    const watermarked = await WatermarkService.apply(buffer, {
+      mode,
+      username: user.username,
+      customText: artistProfile.watermarkCustomText,
+      avatar: mode === "AUTO_AVATAR" ? await loadAvatar(user.image) : null,
+      maxWidth: 1400
+    });
+    const key = newKey(`orders/${order.id}/sketch`, "webp");
+    await storage.put("private", key, watermarked, "image/webp");
 
-    db.update(commissionOrders)
-      .set({
-        sketchWatermarkedUrl: sketchUrl,
-        status: "SKETCH_REVIEW"
-      })
-      .where(eq(commissionOrders.id, id))
-      .run();
-
-    db.insert(orderMessages)
-      .values({
-        id: crypto.randomUUID(),
-        orderId: id,
-        senderId: decoded.id,
+    const updated = await db.transaction(async (tx) => {
+      const o = await transition(tx, order.id, "IN_PROGRESS_SKETCH", "SKETCH_REVIEW", { sketchWatermarkedKey: key });
+      await tx.insert(orderMessages).values({
+        orderId: order.id,
+        senderId: user.id,
         type: "SKETCH_SUBMISSION",
-        content: "El artista subió una propuesta de boceto para tu revisión.",
-        attachments: JSON.stringify([sketchUrl]),
-        createdAt: new Date().toISOString()
-      })
-      .run();
-
-    return { ok: true, sketchUrl };
-  });
-
-  // POST /api/orders/:id/approve-sketch — Comprador aprueba el boceto
-  fastify.post("/:id/approve-sketch", async (request, reply) => {
-    const decoded = (await request.jwtVerify()) as any;
-    const { id } = request.params as any;
-
-    const order = db.select().from(commissionOrders).where(eq(commissionOrders.id, id)).get();
-    if (!order) return reply.status(404).send({ error: "Pedido no encontrado" });
-    if (order.buyerId !== decoded.id) {
-      return reply.status(403).send({ error: "Solo el comprador puede aprobar" });
-    }
-
-    let nextStatus: any = "WORKING_FINAL";
-    if (order.paymentPlanSnapshot === "SPLIT_ON_SKETCH") {
-      nextStatus = "WAITING_PAYMENT_AFTER_SKETCH";
-    }
-
-    db.update(commissionOrders).set({ status: nextStatus }).where(eq(commissionOrders.id, id)).run();
-
-    db.insert(orderMessages)
-      .values({
-        id: crypto.randomUUID(),
-        orderId: id,
-        senderId: decoded.id,
-        type: "SYSTEM_EVENT",
-        content: `Boceto aprobado por el comprador. Próximo paso: ${
-          nextStatus === "WAITING_PAYMENT_AFTER_SKETCH"
-            ? "Abonar el 50% restante para finalizar la obra."
-            : "El artista continúa trabajando en el arte final."
-        }`,
-        createdAt: new Date().toISOString()
-      })
-      .run();
-
-    return { ok: true, nextStatus };
-  });
-
-  // POST /api/orders/:id/deliver-final — Artista sube entrega final (Preview + Archivo HD)
-  fastify.post("/:id/deliver-final", async (request, reply) => {
-    const decoded = (await request.jwtVerify()) as any;
-    const { id } = request.params as any;
-
-    const order = db.select().from(commissionOrders).where(eq(commissionOrders.id, id)).get();
-    if (!order) return reply.status(404).send({ error: "Pedido no encontrado" });
-
-    const artistProfile = db.select().from(artistProfiles).where(eq(artistProfiles.id, order.artistId)).get();
-    if (artistProfile?.userId !== decoded.id) {
-      return reply.status(403).send({ error: "Solo el artista puede entregar" });
-    }
-
-    const data = await request.file();
-    if (!data) return reply.status(400).send({ error: "Archivo requerido" });
-
-    const buffer = await data.toBuffer();
-
-    // 1. Guardar archivo original HD
-    const hdUrl = await WatermarkService.saveUpload(buffer, "png");
-
-    // 2. Generar preview con marca de agua
-    const watermarkMode = (artistProfile?.defaultWatermarkMode as any) || "AUTO_TEXT";
-    const customText = artistProfile?.watermarkCustomText || "TuPuestito • MUESTRA FINAL";
-
-    const watermarked = await WatermarkService.processImage(buffer, {
-      mode: watermarkMode,
-      customText: customText
+        content: "✏️ El artista subió una propuesta de boceto (con marca de agua) para tu revisión.",
+        attachments: [key]
+      });
+      return o;
     });
-    const previewUrl = await WatermarkService.saveUpload(watermarked, "webp");
+    void notifyOrder(updated, "buyer", "Tenés un boceto para revisar", "El artista subió el boceto de tu comisión. Aprobalo o pedí ajustes desde la sala del pedido.");
+    return { ok: true, status: updated.status };
+  });
 
-    let nextStatus: any = "COMPLETED_HD_UNLOCKED";
-    if (order.paymentPlanSnapshot === "SPLIT_ON_FINAL_PREVIEW") {
-      nextStatus = "FINAL_PREVIEW_REVIEW";
+  // ───────────────────────────────────────────────────────────
+  // POST /api/orders/:id/request-changes — comprador pide ajustes
+  // ───────────────────────────────────────────────────────────
+  fastify.post("/:id/request-changes", async (request) => {
+    const user = await requireUser(request);
+    const { order, isBuyer } = await loadOrderFor(request, user);
+    if (!isBuyer) throw new HttpError(403, "Solo el comprador puede pedir cambios");
+    assertStatus(order, "SKETCH_REVIEW", "FINAL_PREVIEW_REVIEW");
+    const { feedback } = parseBody(z.object({ feedback: z.string().trim().min(3).max(2000) }), request.body);
+
+    const included = order.serviceSnapshot.revisionsIncluded;
+    if (order.revisionsUsed >= included) {
+      throw new HttpError(409, `Ya usaste las ${included} revisiones incluidas. Coordiná ajustes extra con el artista por el chat.`);
     }
+    const next = order.status === "FINAL_PREVIEW_REVIEW" ? "WORKING_FINAL" : "IN_PROGRESS_SKETCH";
+    const updated = await db.transaction(async (tx) => {
+      const o = await transition(tx, order.id, order.status, next, { revisionsUsed: order.revisionsUsed + 1 });
+      await tx.insert(orderMessages).values({ orderId: order.id, senderId: user.id, type: "TEXT", content: `🔄 Pedido de ajustes: ${feedback}` });
+      await addSystemMessage(tx, order.id, `Revisión ${order.revisionsUsed + 1}/${included} solicitada por el comprador.`);
+      return o;
+    });
+    void notifyOrder(updated, "artist", "El comprador pidió ajustes", feedback);
+    return { ok: true, nextStatus: updated.status };
+  });
 
-    db.update(commissionOrders)
-      .set({
-        previewWatermarkedUrl: previewUrl,
-        finalHdPrivateKey: hdUrl,
-        status: nextStatus
-      })
-      .where(eq(commissionOrders.id, id))
-      .run();
+  // ───────────────────────────────────────────────────────────
+  // POST /api/orders/:id/approve-sketch
+  // ───────────────────────────────────────────────────────────
+  fastify.post("/:id/approve-sketch", async (request) => {
+    const user = await requireUser(request);
+    const { order, isBuyer } = await loadOrderFor(request, user);
+    if (!isBuyer) throw new HttpError(403, "Solo el comprador puede aprobar");
+    assertStatus(order, "SKETCH_REVIEW");
+    const next = order.paymentPlanSnapshot === "SPLIT_ON_SKETCH" ? "WAITING_PAYMENT_AFTER_SKETCH" : "WORKING_FINAL";
+    const updated = await db.transaction(async (tx) => {
+      const o = await transition(tx, order.id, "SKETCH_REVIEW", next);
+      await addSystemMessage(
+        tx,
+        order.id,
+        next === "WAITING_PAYMENT_AFTER_SKETCH"
+          ? "✅ Boceto aprobado. Próximo paso: abonar el 50% restante para que el artista pase a línea y color."
+          : "✅ Boceto aprobado. El artista continúa con la obra final."
+      );
+      return o;
+    });
+    void notifyOrder(updated, "artist", "¡Boceto aprobado!", next === "WAITING_PAYMENT_AFTER_SKETCH" ? "El comprador aprobó el boceto y debe abonar el 50% restante." : "El comprador aprobó el boceto. Ya podés avanzar con la obra final.");
+    return { ok: true, nextStatus: updated.status };
+  });
 
-    db.insert(orderMessages)
-      .values({
-        id: crypto.randomUUID(),
-        orderId: id,
-        senderId: decoded.id,
+  // ───────────────────────────────────────────────────────────
+  // POST /api/orders/:id/deliver-final — doble archivo (Plan §3.A)
+  //   file    = original HD (PNG/JPG/WebP/ZIP/PSD) → bucket privado
+  //   preview = imagen para la vista previa (opcional si `file` es imagen)
+  // ───────────────────────────────────────────────────────────
+  fastify.post("/:id/deliver-final", async (request) => {
+    const user = await requireUser(request);
+    const { order, artistProfile, isArtist } = await loadOrderFor(request, user);
+    if (!isArtist) throw new HttpError(403, "Solo el artista puede entregar");
+    assertStatus(order, "WORKING_FINAL");
+
+    let hd: { buffer: Buffer; filename: string; mimetype: string } | null = null;
+    let previewSource: Buffer | null = null;
+    let mode = artistProfile.defaultWatermarkMode;
+    for await (const part of request.parts({ limits: { fileSize: MAX_DELIVERY_BYTES, files: 2 } })) {
+      if (part.type === "file") {
+        const buffer = await part.toBuffer();
+        if (part.file.truncated) throw new HttpError(413, "El archivo supera los 200 MB");
+        if (part.fieldname === "file") hd = { buffer, filename: part.filename, mimetype: part.mimetype };
+        else if (part.fieldname === "preview") previewSource = buffer;
+      } else if (part.fieldname === "watermarkMode") {
+        mode = z.enum(["MANUAL", "AUTO_TEXT", "AUTO_AVATAR"]).catch(mode).parse(part.value);
+      }
+    }
+    if (!hd) throw new HttpError(400, "Subí el archivo final en alta definición");
+
+    const hdIsImage = await WatermarkService.assertImage(hd.buffer).then(() => true, () => false);
+    const source = previewSource ?? (hdIsImage ? hd.buffer : null);
+    if (!source) throw new HttpError(400, "Si el original no es una imagen (ZIP/PSD), subí también una imagen de vista previa");
+    await WatermarkService.assertImage(source).catch((e: Error) => {
+      throw new HttpError(400, e.message);
+    });
+
+    const hdType = hdIsImage ? hd.mimetype : hd.filename.toLowerCase().endsWith(".zip") ? "application/zip" : hd.mimetype || "application/octet-stream";
+    const ext = hd.filename.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase() ?? extensionFor(hdType);
+    const hdKey = newKey(`orders/${order.id}/final`, ext);
+    const previewKey = newKey(`orders/${order.id}/preview`, "webp");
+
+    // Vista previa en baja resolución con marca de agua
+    const preview = await WatermarkService.apply(source, {
+      mode,
+      username: user.username,
+      customText: artistProfile.watermarkCustomText,
+      avatar: mode === "AUTO_AVATAR" ? await loadAvatar(user.image) : null,
+      maxWidth: 1000
+    });
+    await storage.put("private", hdKey, hd.buffer, hdType);
+    await storage.put("private", previewKey, preview, "image/webp");
+
+    // FULL_100 y SPLIT_ON_SKETCH ya están pagos al 100% → se destraba directo
+    const next = order.paymentPlanSnapshot === "SPLIT_ON_FINAL_PREVIEW" ? "FINAL_PREVIEW_REVIEW" : "COMPLETED_HD_UNLOCKED";
+    const safeName = `${order.orderNumber}-${hd.filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80)}`;
+
+    const updated = await db.transaction(async (tx) => {
+      const o = await transition(tx, order.id, "WORKING_FINAL", next, {
+        previewWatermarkedKey: previewKey,
+        finalHdPrivateKey: hdKey,
+        finalHdFilename: safeName,
+        ...(next === "COMPLETED_HD_UNLOCKED" ? { completedAt: new Date() } : {})
+      });
+      await tx.insert(orderMessages).values({
+        orderId: order.id,
+        senderId: user.id,
         type: "FINAL_PREVIEW_SUBMISSION",
         content:
-          nextStatus === "FINAL_PREVIEW_REVIEW"
-            ? "El artista subió la vista previa de la obra terminada. Revisala y aprobá para abonar el saldo y descargar en alta calidad."
-            : "¡Obra final entregada! Podés descargar tus archivos en alta definición.",
-        attachments: JSON.stringify([previewUrl]),
-        createdAt: new Date().toISOString()
-      })
-      .run();
-
-    return { ok: true, nextStatus };
+          next === "FINAL_PREVIEW_REVIEW"
+            ? "🎨 El artista subió la obra terminada (vista previa con marca de agua). Aprobala y aboná el 50% restante para desbloquear el original HD."
+            : "🎉 ¡Obra final entregada! Ya podés descargar el archivo original en alta definición.",
+        attachments: [previewKey]
+      });
+      return o;
+    });
+    void notifyOrder(
+      updated,
+      "buyer",
+      next === "FINAL_PREVIEW_REVIEW" ? "Tu obra está terminada" : "¡Tu comisión está lista!",
+      next === "FINAL_PREVIEW_REVIEW" ? "Revisá la vista previa, aprobala y aboná el saldo para descargar el original HD." : "Ya podés descargar tu ilustración en alta definición."
+    );
+    return { ok: true, nextStatus: updated.status };
   });
 
-  // POST /api/orders/:id/review — Comprador deja reseña de 1 a 5 estrellas
-  fastify.post("/:id/review", async (request, reply) => {
-    const decoded = (await request.jwtVerify()) as any;
-    const { id } = request.params as any;
-    const { rating, comment } = request.body as any;
+  // POST /api/orders/:id/approve-final-preview
+  fastify.post("/:id/approve-final-preview", async (request) => {
+    const user = await requireUser(request);
+    const { order, isBuyer } = await loadOrderFor(request, user);
+    if (!isBuyer) throw new HttpError(403, "Solo el comprador puede aprobar la vista previa");
+    assertStatus(order, "FINAL_PREVIEW_REVIEW");
+    const updated = await db.transaction(async (tx) => {
+      const o = await transition(tx, order.id, "FINAL_PREVIEW_REVIEW", "WAITING_PAYMENT_BEFORE_HD");
+      await addSystemMessage(tx, order.id, "✅ Vista previa final aprobada. Al acreditarse el 50% restante se desbloquea el original HD sin marca de agua.");
+      return o;
+    });
+    void notifyOrder(updated, "artist", "Vista previa aprobada", "El comprador aprobó la obra final y debe abonar el saldo.");
+    return { ok: true, nextStatus: updated.status };
+  });
 
-    const order = db.select().from(commissionOrders).where(eq(commissionOrders.id, id)).get();
-    if (!order) return reply.status(404).send({ error: "Pedido no encontrado" });
-    if (order.buyerId !== decoded.id) {
-      return reply.status(403).send({ error: "Solo el comprador puede calificar" });
+  // ───────────────────────────────────────────────────────────
+  // GET /api/orders/:id/download-hd — el link al original JAMÁS sale sin el 100% APPROVED
+  // ───────────────────────────────────────────────────────────
+  fastify.get("/:id/download-hd", async (request) => {
+    const user = await requireUser(request);
+    const { order, isBuyer, isArtist } = await loadOrderFor(request, user);
+    if (!isBuyer && !isArtist) throw new HttpError(403, "No autorizado");
+    if (!order.finalHdPrivateKey) throw new HttpError(404, "Todavía no hay entrega final");
+
+    if (isBuyer) {
+      const payments = await db.select().from(orderMilestonePayments).where(eq(orderMilestonePayments.orderId, order.id));
+      const paid = payments.filter((p) => p.status === "APPROVED").reduce((acc, p) => acc + p.grossAmount, 0);
+      if (order.status !== "COMPLETED_HD_UNLOCKED" || paid < order.totalAmount) {
+        throw new HttpError(402, "El archivo HD se desbloquea cuando el 100% del pago figura acreditado");
+      }
     }
+    const url = await storage.signedGetUrl(order.finalHdPrivateKey, {
+      expiresIn: 5 * 60,
+      downloadName: order.finalHdFilename ?? `${order.orderNumber}-original`
+    });
+    return { url };
+  });
 
-    const reviewId = crypto.randomUUID();
-    db.insert(reviews)
-      .values({
-        id: reviewId,
-        orderId: id,
-        artistId: order.artistId,
-        buyerId: decoded.id,
-        rating: Number(rating) || 5,
-        comment: comment || "",
-        createdAt: new Date().toISOString()
-      })
-      .run();
-
-    return { ok: true, id: reviewId };
+  // ───────────────────────────────────────────────────────────
+  // POST /api/orders/:id/review — reseña 1-5 (solo pedidos completados)
+  // ───────────────────────────────────────────────────────────
+  fastify.post("/:id/review", async (request) => {
+    const user = await requireUser(request);
+    const { order, isBuyer } = await loadOrderFor(request, user);
+    if (!isBuyer) throw new HttpError(403, "Solo el comprador puede calificar");
+    assertStatus(order, "COMPLETED_HD_UNLOCKED");
+    const body = parseBody(
+      z.object({ rating: z.number().int().min(1).max(5), comment: z.string().trim().max(2000).optional() }),
+      request.body
+    );
+    const [created] = await db
+      .insert(reviews)
+      .values({ orderId: order.id, artistId: order.artistId, buyerId: user.id, rating: body.rating, comment: body.comment ?? "" })
+      .onConflictDoNothing({ target: reviews.orderId })
+      .returning({ id: reviews.id });
+    if (!created) throw new HttpError(409, "Ya calificaste este pedido");
+    return { ok: true, id: created.id };
   });
 }
+

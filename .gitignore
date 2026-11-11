@@ -6,8 +6,12 @@ dist
 .env.local
 .env.*.local
 *.log
-data/*.db
-data/*.db-wal
-data/*.db-shm
-uploads/*
-!uploads/.gitkeep
+
+.env.production
+*.tsbuildinfo
+# Almacenamiento local de desarrollo (STORAGE_DRIVER=local)
+apps/api/storage/
+# Restos del MVP con SQLite / uploads públicos (ya no se usan)
+apps/api/data/
+apps/api/uploads/
+apps/api/e2e/*.png

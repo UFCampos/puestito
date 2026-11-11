@@ -1,0 +1,23 @@
+# Plan §1: Caddy como reverse proxy con HTTPS automático.
+# Si usás Cloudflare en modo proxy, configurá SSL/TLS = "Full (strict)".
+{
+	email {$ACME_EMAIL}
+}
+
+{$WEB_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy web:3000
+}
+
+www.{$WEB_DOMAIN} {
+	redir https://{$WEB_DOMAIN}{uri} permanent
+}
+
+{$API_DOMAIN} {
+	encode zstd gzip
+	# Entregas finales de hasta 200 MB
+	request_body {
+		max_size 210MB
+	}
+	reverse_proxy api:4000
+}
