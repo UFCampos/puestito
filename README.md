@@ -6,6 +6,24 @@ La especificación de referencia es [`docs/business-planning/plan_tecnico_mvp.md
 
 ---
 
+## 🎬 Demos del Flujo Completo
+
+### 👤 Lado del Cliente (Comprador)
+Explorar artistas, registrarse, solicitar una comisión 50/50 con extras y referencias, pagar la seña, pedir ajustes sobre el boceto, aprobar la entrega, abonar el saldo restante, descargar el original en HD y dejar una reseña.
+
+<video src="https://raw.githubusercontent.com/UFCampos/puestito/feat/service-editor-and-delivery-packages/docs/demo/demo-cliente.mp4" controls width="100%"></video>
+
+> 💡 *Si tu visor de Markdown no reproduce el video en línea, podés [abrir `docs/demo/demo-cliente.mp4` directamente](./docs/demo/demo-cliente.mp4).*
+
+### 🎨 Lado del Artista
+Crear una nueva comisión por etapas (milestones) con el asistente tipo Fiverr, editar el precio de un servicio publicado, aceptar un pedido entrante, entregar cada etapa (incluyendo entrega final en `.zip` con vista previa protegida por marca de agua) y recibir la reseña en su vidriera pública.
+
+<video src="https://raw.githubusercontent.com/UFCampos/puestito/feat/service-editor-and-delivery-packages/docs/demo/demo-artista.mp4" controls width="100%"></video>
+
+> 💡 *Si tu visor de Markdown no reproduce el video en línea, podés [abrir `docs/demo/demo-artista.mp4` directamente](./docs/demo/demo-artista.mp4).*
+
+---
+
 ## 🧱 Stack (Plan §1)
 
 | Capa | Tecnología |
