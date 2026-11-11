@@ -57,6 +57,20 @@ pnpm test:e2e
 
 Levanta un PostgreSQL embebido (PGlite), corre las migraciones y el seed, y recorre el flujo completo: auth, explorar, referencias firmadas, pedido 50/50, marca de agua, bloqueo del HD, pagos, reseñas y controles de permisos.
 
+Corre en un entorno aislado (API en `:4100`, Postgres embebido en `:55432`), así que se puede ejecutar con `pnpm dev` abierto sin tocar tu base de desarrollo.
+
+### Límites de subida
+
+| Archivo | Formatos | Máximo | Variable |
+|---|---|---|---|
+| Referencias del comprador | PNG, JPG, WebP | 5 MB c/u (hasta 10) | fijo (Plan §6) |
+| Avatar / banner | PNG, JPG, WebP | 8 MB | `MAX_AVATAR_MB` |
+| Obra de portfolio | PNG, JPG, WebP | 25 MB | `MAX_PORTFOLIO_MB` |
+| Boceto y vista previa | PNG, JPG, WebP | 30 MB | `MAX_SKETCH_MB` |
+| Entrega final | PNG, JPG, WebP, **.zip**, **.rar**, .psd | 200 MB | `MAX_FINAL_DELIVERY_MB` |
+
+El formato de la entrega final se valida por el contenido del archivo, no por la extensión. Si es un paquete (.zip, .rar, .psd), el artista sube además una imagen para la vista previa con marca de agua. El frontend lee estos límites de `GET /api/config` y avisa antes de subir.
+
 ### Migraciones
 
 ```bash

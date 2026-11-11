@@ -1,5 +1,5 @@
 import sharp from "sharp";
-const API = "http://localhost:4000";
+const API = process.env.API_URL || "http://localhost:4100";
 const WEB = "http://localhost:3000";
 function client() {
   const cookies = {};
@@ -115,3 +115,52 @@ ok("buyer cannot create service", await buyer("/api/artists/services", { method:
 ok("become artist", await stranger("/api/me/artist-profile", { method: "POST", json: { acceptHumanArtPledge: true } }));
 ok("webhook (mock mode ignored)", await client()("/api/payments/webhook", { method: "POST", json: { type: "payment", data: { id: "1" } } }));
 ok("CORS foreign origin blocked", await client()("/api/auth/sign-in/email", { method: "POST", json: { email: "x@y.com", password: "12345678" }, headers: { Origin: "https://evil.com" } }), 403);
+
+// ───────── Edición de servicios (extras por id, pausar, borrar) ─────────
+ok("public config", await client()("/api/config"));
+let mine = ok("my services", await artist("/api/artists/me/services"));
+const nuevo = mine.services.find((s) => s.title === "Nuevo servicio");
+const addonA = nuevo.addons[0];
+const svcBody = { title: "Servicio editado", description: "desc nueva", priceArs: 12000, priceUsd: 10, paymentPlan: "FULL_100", turnaroundDays: 6, maxSlots: 2, revisionsIncluded: 1, rating: "SFW", tags: ["chibi", "emotes"] };
+ok("edit service", await artist(`/api/artists/services/${nuevo.id}`, { method: "PUT", json: { ...svcBody, addons: [{ id: addonA.id, name: "extra editado", priceArs: 2000 }, { name: "extra nuevo", priceArs: 500 }] } }));
+ok("edit service dup addons", await artist(`/api/artists/services/${nuevo.id}`, { method: "PUT", json: { ...svcBody, addons: [{ name: "x", priceArs: 1 }, { name: "X", priceArs: 2 }] } }), 400);
+ok("buyer cannot edit service", await buyer(`/api/artists/services/${nuevo.id}`, { method: "PUT", json: { ...svcBody, addons: [] } }), 403);
+mine = ok("my services after edit", await artist("/api/artists/me/services"));
+let edited = mine.services.find((s) => s.id === nuevo.id);
+const keptId = edited.addons.find((a) => a.name === "extra editado")?.id === addonA.id;
+console.log(`   ${keptId && edited.addons.length === 2 && edited.title === "Servicio editado" && edited.priceArs === 12000 ? "✅" : "❌"} addon id conservado, 2 extras, título y precio actualizados`);
+if (!(keptId && edited.addons.length === 2)) process.exitCode = 1;
+ok("remove one addon", await artist(`/api/artists/services/${nuevo.id}`, { method: "PUT", json: { ...svcBody, addons: [{ id: addonA.id, name: "extra editado", priceArs: 2000 }] } }));
+ok("pause service", await artist(`/api/artists/services/${nuevo.id}/status`, { method: "PATCH", json: { isActive: false } }));
+const pubPaused = ok("public profile (paused)", await buyer("/api/artists/maomao"));
+console.log(`   ${pubPaused.services.some((s) => s.id === nuevo.id) ? "❌" : "✅"} servicio pausado no aparece en el perfil público`);
+ok("order on paused service", await buyer("/api/orders", { method: "POST", json: { serviceId: nuevo.id, buyerBrief: "pedido a servicio pausado", acceptedTerms: true } }), 404);
+ok("republish service", await artist(`/api/artists/services/${nuevo.id}/status`, { method: "PATCH", json: { isActive: true } }));
+
+// ───────── Entrega final: .zip / .rar, validación de formato y límite de tamaño ─────────
+const o3 = ok("order 3 (FULL_100)", await buyer("/api/orders", { method: "POST", json: { serviceId: nuevo.id, addonIds: [addonA.id], buyerBrief: "Pack de emotes para mi canal", acceptedTerms: true } }));
+ok("accept 3", await artist(`/api/orders/${o3.id}/accept`, { method: "POST" }));
+const co3 = ok("checkout 3", await buyer(`/api/orders/${o3.id}/checkout`, { method: "POST" }));
+ok("pay 3", await buyer("/api/payments/mock-approve", { method: "POST", form: new URLSearchParams({ milestoneId: co3.milestoneId, result: "approved" }) }), 302);
+ok("sketch 3", await artist(`/api/orders/${o3.id}/sketch`, { method: "POST", form: fd({ watermarkMode: "MANUAL" }, { file: [await png(600, 600, "#445566"), "s.png", "image/png"] }) }));
+ok("approve sketch 3", await buyer(`/api/orders/${o3.id}/approve-sketch`, { method: "POST" }));
+const zipBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(2000, 1)]);
+const rarBytes = Buffer.concat([Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00]), Buffer.alloc(2000, 2)]);
+const previewPng = await png(900, 900, "#cc8800");
+const deliver = (files) => artist(`/api/orders/${o3.id}/deliver-final`, { method: "POST", form: fd({ watermarkMode: "AUTO_TEXT" }, files) });
+ok("deliver .txt disfrazado de .zip", await deliver({ file: [Buffer.from("hola, no soy un zip"), "entrega.zip", "application/zip"], preview: [previewPng, "p.png", "image/png"] }), 400);
+ok("deliver .zip sin vista previa", await deliver({ file: [zipBytes, "entrega.zip", "application/zip"] }), 400);
+ok("deliver archivo > límite", await deliver({ file: [Buffer.concat([zipBytes, Buffer.alloc(3 * 1024 * 1024, 7)]), "enorme.zip", "application/zip"], preview: [previewPng, "p.png", "image/png"] }), 413);
+ok("deliver .rar + vista previa", await deliver({ file: [rarBytes, "pack final.rar", "application/x-rar-compressed"], preview: [previewPng, "p.png", "image/png"] }));
+const o3done = ok("order 3 completed", await buyer(`/api/orders/${o3.id}`));
+const dl3 = ok("download .rar", await buyer(`/api/orders/${o3.id}/download-hd`));
+const rarRes = await fetch(dl3.url); const rarBack = Buffer.from(await rarRes.arrayBuffer());
+const rarOk = o3done.order.status === "COMPLETED_HD_UNLOCKED" && rarBack.equals(rarBytes) && /\.rar"$/.test(rarRes.headers.get("content-disposition") ?? "");
+console.log(`   ${rarOk ? "✅" : "❌"} .rar íntegro (${rarBack.length} bytes) ${rarRes.headers.get("content-type")} ${rarRes.headers.get("content-disposition")}`);
+if (!rarOk) process.exitCode = 1;
+
+const delUsed = ok("delete service with orders → pausa", await artist(`/api/artists/services/${nuevo.id}`, { method: "DELETE" }));
+const tmpSvc = ok("create temp service", await artist("/api/artists/services", { method: "POST", json: { ...svcBody, title: "Temporal", addons: [] } }));
+const delFresh = ok("delete service without orders", await artist(`/api/artists/services/${tmpSvc.id}`, { method: "DELETE" }));
+console.log(`   ${delUsed.paused && !delUsed.deleted && delFresh.deleted ? "✅" : "❌"} con pedidos se pausa, sin pedidos se borra`);
+if (!(delUsed.paused && delFresh.deleted)) process.exitCode = 1;

@@ -2,6 +2,13 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { MultipartFile } from "@fastify/multipart";
 import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { z } from "zod";
+import sharp from "sharp";
+import crypto from "node:crypto";
+import { createWriteStream } from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { alias } from "drizzle-orm/pg-core";
 import { db } from "../db/index.js";
 import {
@@ -17,6 +24,7 @@ import {
 import { config } from "../config.js";
 import { HttpError, parseBody, requireUser, type SessionUser } from "../lib/http.js";
 import { MAX_REFERENCE_BYTES, extensionFor, newKey, storage } from "../services/storage.service.js";
+import { DELIVERY_FORMATS, LIMITS, LIMITS_MB, sniffArchive } from "../lib/limits.js";
 import { WatermarkService } from "../services/watermark.service.js";
 import { MercadoPagoService, MercadoPagoError } from "../services/mercadopago.service.js";
 import { notifyDiscord } from "../services/notification.service.js";
@@ -36,7 +44,6 @@ import {
   type Order
 } from "../services/order.service.js";
 
-const MAX_DELIVERY_BYTES = 200 * 1024 * 1024;
 
 /** Carga el pedido y determina el rol del usuario; 404 si no participa (no revela existencia) */
 async function loadOrderFor(request: FastifyRequest, user: SessionUser) {
@@ -483,10 +490,10 @@ export async function orderRoutes(fastify: FastifyInstance) {
     if (!isArtist) throw new HttpError(403, "Solo el artista puede subir bocetos");
     assertStatus(order, "IN_PROGRESS_SKETCH");
 
-    const file = await request.file({ limits: { fileSize: 30 * 1024 * 1024 } });
+    const file = await request.file({ limits: { fileSize: LIMITS.sketchBytes } });
     if (!file) throw new HttpError(400, "Archivo requerido");
-    const buffer = await file.toBuffer();
-    if (file.file.truncated) throw new HttpError(413, "El boceto supera los 30 MB");
+    const buffer = await file.toBuffer().catch(() => null);
+    if (!buffer || file.file.truncated) throw new HttpError(413, `El boceto supera los ${LIMITS_MB.sketch} MB`);
     await WatermarkService.assertImage(buffer).catch((e: Error) => {
       throw new HttpError(400, e.message);
     });
@@ -568,8 +575,9 @@ export async function orderRoutes(fastify: FastifyInstance) {
 
   // ───────────────────────────────────────────────────────────
   // POST /api/orders/:id/deliver-final — doble archivo (Plan §3.A)
-  //   file    = original HD (PNG/JPG/WebP/ZIP/PSD) → bucket privado
-  //   preview = imagen para la vista previa (opcional si `file` es imagen)
+  //   file    = original HD: imagen (PNG/JPG/WebP) o paquete .zip / .rar / .psd → bucket privado
+  //   preview = imagen para la vista previa (obligatoria si `file` no es una imagen)
+  // El original se escribe a un archivo temporal y se sube por streaming: nunca entra entero en memoria.
   // ───────────────────────────────────────────────────────────
   fastify.post("/:id/deliver-final", async (request) => {
     const user = await requireUser(request);
@@ -577,47 +585,101 @@ export async function orderRoutes(fastify: FastifyInstance) {
     if (!isArtist) throw new HttpError(403, "Solo el artista puede entregar");
     assertStatus(order, "WORKING_FINAL");
 
-    let hd: { buffer: Buffer; filename: string; mimetype: string } | null = null;
+    const tmpPath = path.join(os.tmpdir(), `tp-final-${crypto.randomUUID()}`);
+    const previewKey = newKey(`orders/${order.id}/preview`, "webp");
+    let hd: { filename: string; size: number } | null = null;
     let previewSource: Buffer | null = null;
     let mode = artistProfile.defaultWatermarkMode;
-    for await (const part of request.parts({ limits: { fileSize: MAX_DELIVERY_BYTES, files: 2 } })) {
-      if (part.type === "file") {
-        const buffer = await part.toBuffer();
-        if (part.file.truncated) throw new HttpError(413, "El archivo supera los 200 MB");
-        if (part.fieldname === "file") hd = { buffer, filename: part.filename, mimetype: part.mimetype };
-        else if (part.fieldname === "preview") previewSource = buffer;
-      } else if (part.fieldname === "watermarkMode") {
-        mode = z.enum(["MANUAL", "AUTO_TEXT", "AUTO_AVATAR"]).catch(mode).parse(part.value);
+    let hdKey = "";
+    let hdExt = "";
+
+    try {
+      for await (const part of request.parts({ limits: { fileSize: LIMITS.finalDeliveryBytes, files: 2 } })) {
+        if (part.type === "file") {
+          if (part.fieldname === "file" && !hd) {
+            await pipeline(part.file, createWriteStream(tmpPath)).catch((err: { code?: string }) => {
+              if (err?.code === "FST_REQ_FILE_TOO_LARGE") {
+                throw new HttpError(413, `El archivo final supera los ${LIMITS_MB.finalDelivery} MB`);
+              }
+              throw err;
+            });
+            if (part.file.truncated) {
+              throw new HttpError(413, `El archivo final supera los ${LIMITS_MB.finalDelivery} MB`);
+            }
+            hd = { filename: part.filename || "entrega", size: (await fsp.stat(tmpPath)).size };
+          } else if (part.fieldname === "preview" && !previewSource) {
+            const chunks: Buffer[] = [];
+            let total = 0;
+            for await (const chunk of part.file) {
+              total += (chunk as Buffer).length;
+              if (total > LIMITS.finalPreviewBytes) {
+                throw new HttpError(413, `La imagen de vista previa supera los ${LIMITS_MB.finalPreview} MB`);
+              }
+              chunks.push(chunk as Buffer);
+            }
+            previewSource = Buffer.concat(chunks);
+          } else {
+            part.file.resume();
+          }
+        } else if (part.fieldname === "watermarkMode") {
+          mode = z.enum(["MANUAL", "AUTO_TEXT", "AUTO_AVATAR"]).catch(mode).parse(part.value);
+        }
       }
+      if (!hd || hd.size === 0) throw new HttpError(400, "Subí el archivo final (imagen, .zip o .rar)");
+
+      // El formato se decide por el contenido real del archivo, no por su extensión
+      const handle = await fsp.open(tmpPath, "r");
+      const head = Buffer.alloc(16);
+      await handle.read(head, 0, 16, 0);
+      await handle.close();
+      const archive = sniffArchive(head);
+
+      let hdType: string;
+      if (archive) {
+        hdType = DELIVERY_FORMATS[archive].contentType;
+        hdExt = DELIVERY_FORMATS[archive].ext;
+      } else {
+        const meta = await sharp(tmpPath).metadata().catch(() => null);
+        const imageExt = ({ png: "png", jpeg: "jpg", webp: "webp" } as Record<string, string>)[meta?.format ?? ""];
+        if (!meta?.width || !imageExt) {
+          throw new HttpError(400, "Formato no admitido. Subí una imagen PNG, JPG o WebP, o un paquete .zip, .rar o .psd");
+        }
+        hdType = `image/${meta.format}`;
+        hdExt = imageExt;
+      }
+
+      const source: Buffer | string | null = previewSource ?? (archive ? null : tmpPath);
+      if (!source) {
+        throw new HttpError(400, "Si entregás un .zip, .rar o .psd, subí también una imagen para la vista previa");
+      }
+      await WatermarkService.assertImage(source).catch((e: Error) => {
+        throw new HttpError(400, e.message);
+      });
+
+      // Vista previa en baja resolución con marca de agua
+      const preview = await WatermarkService.apply(source, {
+        mode,
+        username: user.username,
+        customText: artistProfile.watermarkCustomText,
+        avatar: mode === "AUTO_AVATAR" ? await loadAvatar(user.image) : null,
+        maxWidth: 1000
+      });
+      hdKey = newKey(`orders/${order.id}/final`, hdExt);
+      await storage.putFile("private", hdKey, tmpPath, hd.size, hdType);
+      await storage.put("private", previewKey, preview, "image/webp");
+    } finally {
+      await fsp.rm(tmpPath, { force: true }).catch(() => {});
     }
-    if (!hd) throw new HttpError(400, "Subí el archivo final en alta definición");
-
-    const hdIsImage = await WatermarkService.assertImage(hd.buffer).then(() => true, () => false);
-    const source = previewSource ?? (hdIsImage ? hd.buffer : null);
-    if (!source) throw new HttpError(400, "Si el original no es una imagen (ZIP/PSD), subí también una imagen de vista previa");
-    await WatermarkService.assertImage(source).catch((e: Error) => {
-      throw new HttpError(400, e.message);
-    });
-
-    const hdType = hdIsImage ? hd.mimetype : hd.filename.toLowerCase().endsWith(".zip") ? "application/zip" : hd.mimetype || "application/octet-stream";
-    const ext = hd.filename.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase() ?? extensionFor(hdType);
-    const hdKey = newKey(`orders/${order.id}/final`, ext);
-    const previewKey = newKey(`orders/${order.id}/preview`, "webp");
-
-    // Vista previa en baja resolución con marca de agua
-    const preview = await WatermarkService.apply(source, {
-      mode,
-      username: user.username,
-      customText: artistProfile.watermarkCustomText,
-      avatar: mode === "AUTO_AVATAR" ? await loadAvatar(user.image) : null,
-      maxWidth: 1000
-    });
-    await storage.put("private", hdKey, hd.buffer, hdType);
-    await storage.put("private", previewKey, preview, "image/webp");
 
     // FULL_100 y SPLIT_ON_SKETCH ya están pagos al 100% → se destraba directo
     const next = order.paymentPlanSnapshot === "SPLIT_ON_FINAL_PREVIEW" ? "FINAL_PREVIEW_REVIEW" : "COMPLETED_HD_UNLOCKED";
-    const safeName = `${order.orderNumber}-${hd.filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80)}`;
+    // El nombre de descarga lleva la extensión real detectada, no la que venía en el archivo
+    const baseName =
+      hd.filename
+        .replace(/\.[a-z0-9]{1,5}$/i, "")
+        .replace(/[^a-zA-Z0-9._-]/g, "_")
+        .slice(-70) || "entrega";
+    const safeName = `${order.orderNumber}-${baseName}.${hdExt}`;
 
     const updated = await db.transaction(async (tx) => {
       const o = await transition(tx, order.id, "WORKING_FINAL", next, {

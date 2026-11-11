@@ -82,3 +82,42 @@ export const PLAN_LABEL: Record<string, string> = {
   SPLIT_ON_SKETCH: "50% seña + 50% al aprobar el boceto",
   SPLIT_ON_FINAL_PREVIEW: "50% seña + 50% al aprobar la vista previa final"
 };
+
+export interface AppConfig {
+  uploadLimitsMb: {
+    reference: number;
+    avatar: number;
+    portfolio: number;
+    sketch: number;
+    finalPreview: number;
+    finalDelivery: number;
+  };
+  finalDeliveryFormats: string[];
+  platformFeePercent: number;
+  depositExpirationHours: number;
+}
+
+export const DEFAULT_APP_CONFIG: AppConfig = {
+  uploadLimitsMb: { reference: 5, avatar: 8, portfolio: 25, sketch: 30, finalPreview: 30, finalDelivery: 200 },
+  finalDeliveryFormats: ["png", "jpg", "webp", "zip", "rar", "psd"],
+  platformFeePercent: 5,
+  depositExpirationHours: 72
+};
+
+let configPromise: Promise<AppConfig> | null = null;
+
+/** Límites de subida y reglas de la plataforma (una sola consulta por sesión de navegación) */
+export function fetchAppConfig(): Promise<AppConfig> {
+  configPromise ??= apiFetch<AppConfig>("/api/config").catch(() => {
+    configPromise = null;
+    return DEFAULT_APP_CONFIG;
+  });
+  return configPromise;
+}
+
+/** Devuelve un mensaje de error si el archivo supera el límite, o null si está bien */
+export function fileTooLarge(file: File, maxMb: number): string | null {
+  if (file.size <= maxMb * 1024 * 1024) return null;
+  const sizeMb = (file.size / 1024 / 1024).toFixed(1);
+  return `"${file.name}" pesa ${sizeMb} MB y el máximo es ${maxMb} MB.`;
+}
