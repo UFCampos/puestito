@@ -10,7 +10,8 @@
     "db:seed": "pnpm --filter @tupuestito/api db:seed",
     "test:e2e": "pnpm --filter @tupuestito/api test:e2e",
     "prod:up": "docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build",
-    "typecheck": "pnpm --filter @tupuestito/api typecheck && pnpm --filter @tupuestito/web exec tsc --noEmit"
+    "typecheck": "pnpm --filter @tupuestito/api typecheck && pnpm --filter @tupuestito/web exec tsc --noEmit",
+    "db:embedded": "node apps/api/dev-db.mjs"
   },
   "devDependencies": {
     "typescript": "^5.7.3"
