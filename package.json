@@ -11,7 +11,8 @@
     "test:e2e": "pnpm --filter @tupuestito/api test:e2e",
     "prod:up": "docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build",
     "typecheck": "pnpm --filter @tupuestito/api typecheck && pnpm --filter @tupuestito/web exec tsc --noEmit",
-    "db:embedded": "node apps/api/dev-db.mjs"
+    "db:embedded": "node apps/api/dev-db.mjs",
+    "test:unit": "pnpm --filter @tupuestito/api test:unit"
   },
   "devDependencies": {
     "typescript": "^5.7.3"

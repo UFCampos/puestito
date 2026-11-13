@@ -4,8 +4,22 @@
 	email {$ACME_EMAIL}
 }
 
+(logs) {
+	log {
+		output stdout
+		format console
+	}
+}
+
 {$WEB_DOMAIN} {
+	import logs
 	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
 	reverse_proxy web:3000
 }
 
@@ -14,7 +28,12 @@ www.{$WEB_DOMAIN} {
 }
 
 {$API_DOMAIN} {
+	import logs
 	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
 	# Entregas finales de hasta 200 MB
 	request_body {
 		max_size 210MB
