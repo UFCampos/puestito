@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { apiFetch, API_URL, STATUS_LABEL, fileTooLarge, planSummary, resolveImageUrl } from "../../lib/api";
+import { apiFetch, API_URL, STATUS_LABEL, TERMINAL_STATUSES, fileTooLarge, formatDate, planSummary, resolveImageUrl } from "../../lib/api";
 import { useAppConfig } from "../../lib/useAppConfig";
 
 const SERVICE_FEEDBACK: Record<string, string> = {
@@ -94,7 +94,12 @@ function ArtistDashboardPage() {
       setServices(myServices.services || []);
       setMpConnected(Boolean(payStatus?.mercadopago?.connected));
       setPaymentsMode(payStatus?.paymentsMode ?? "live");
-      setOrders((myOrders.orders || []).filter((o: any) => o.role === "ARTIST"));
+      const attention = (o: any) => o.awaitingMe || o.unread || o.status === "DISPUTED";
+      setOrders(
+        (myOrders.orders || [])
+          .filter((o: any) => o.role === "ARTIST" && !TERMINAL_STATUSES.includes(o.status))
+          .sort((a: any, b: any) => Number(attention(b)) - Number(attention(a)))
+      );
     } finally {
       setLoading(false);
     }
@@ -358,6 +363,12 @@ function ArtistDashboardPage() {
         </div>
       )}
 
+      {!hasMP && paymentsMode === "live" && (
+        <div role="alert" className="mt-4 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-900">
+          ⚠️ Vinculá tu cuenta de Mercado Pago: sin eso no podés aceptar pedidos.
+        </div>
+      )}
+
       {/* Onboarding Checklist in 5 Minutes */}
       <div className="mt-6 rounded-3xl border border-indigo-100 bg-gradient-to-r from-indigo-50/70 via-white to-pink-50/60 p-6 shadow-sm">
         <h2 className="text-sm font-extrabold uppercase tracking-wider text-indigo-950">
@@ -372,7 +383,7 @@ function ArtistDashboardPage() {
           <div className={`rounded-2xl border p-3.5 text-xs ${hasMP ? "border-emerald-200 bg-emerald-50/70 text-emerald-900" : "border-slate-200 bg-white text-slate-600"}`}>
             <span className="text-base">{hasMP ? "✅" : "2️⃣"}</span>
             <p className="mt-1 font-bold">Vincular Mercado Pago</p>
-            <p className="mt-0.5 text-[11px] opacity-80">Para cobro directo con Split 95/5.</p>
+            <p className="mt-0.5 text-[11px] opacity-80">Obligatorio para aceptar pedidos.</p>
           </div>
           <div className={`rounded-2xl border p-3.5 text-xs ${hasPortfolio ? "border-emerald-200 bg-emerald-50/70 text-emerald-900" : "border-slate-200 bg-white text-slate-600"}`}>
             <span className="text-base">{hasPortfolio ? "✅" : "3️⃣"}</span>
@@ -407,13 +418,15 @@ function ArtistDashboardPage() {
               >
                 <div className="flex items-center justify-between text-xs">
                   <span className="font-mono text-slate-400">#{o.orderNumber || o.id.slice(0, 8)}</span>
-                  <span className="rounded-full bg-indigo-50 px-2.5 py-0.5 font-bold text-indigo-700">
-                    {STATUS_LABEL[o.status] ?? o.status}
+                  <span className="flex gap-1">
+                    {o.awaitingMe && <span className="rounded-full bg-emerald-600 px-2 py-0.5 font-bold text-white">Te toca</span>}
+                    {o.unread && <span className="rounded-full bg-rose-600 px-2 py-0.5 font-bold text-white">Novedades</span>}
+                    <span className="rounded-full bg-indigo-50 px-2.5 py-0.5 font-bold text-indigo-700">{STATUS_LABEL[o.status] ?? o.status}</span>
                   </span>
                 </div>
                 <p className="mt-1.5 line-clamp-1 text-sm font-bold text-slate-900">{o.buyerBrief}</p>
                 <p className="mt-1 text-xs font-semibold text-purple-600">
-                  ${Number(o.totalAmount).toLocaleString("es-AR")} ARS • Gestionar entrega →
+                  ${Number(o.totalAmount).toLocaleString("es-AR")} ARS{o.workDueAt ? ` • Entrega estimada ${formatDate(o.workDueAt)}` : ""} • Gestionar →
                 </p>
               </Link>
             ))}
@@ -454,7 +467,7 @@ function ArtistDashboardPage() {
                       srv.isActive ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-600"
                     }`}
                   >
-                    {srv.isActive ? "Publicada" : "Pausada"}
+                    {srv.moderatedAt ? "Despublicada por moderación" : srv.isActive ? "Publicada" : "Pausada"}
                   </span>
                   <span className="rounded-full bg-purple-50 px-2.5 py-0.5 text-[11px] font-bold text-purple-700">
                     {planSummary(srv.paymentPlan, srv.milestones)}
@@ -479,6 +492,8 @@ function ArtistDashboardPage() {
                   </Link>
                   <button
                     type="button"
+                    disabled={Boolean(srv.moderatedAt)}
+                    title={srv.moderatedAt ? `Despublicada por moderación${srv.moderationReason ? `: ${srv.moderationReason}` : ""}. Escribinos a soporte para revisarlo.` : undefined}
                     onClick={() => handleToggleService(srv)}
                     className="rounded-lg border border-slate-200 px-3.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
                   >
@@ -511,14 +526,14 @@ function ArtistDashboardPage() {
                 onChange={(e) => setCommissionStatus(e.target.value)}
                 className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold"
               >
-                <option value="OPEN">🟢 Abiertas (OPEN)</option>
-                <option value="WAITLIST">🟡 Lista de Espera (WAITLIST)</option>
-                <option value="CLOSED">🔴 Cerradas (CLOSED)</option>
+                <option value="OPEN">🟢 Abiertas</option>
+                <option value="WAITLIST">🟡 Lista de espera</option>
+                <option value="CLOSED">🔴 Cerradas</option>
               </select>
             </div>
             <div>
               <label className="mb-1 block text-xs font-bold text-slate-700">
-                Marca de Agua por Defecto (Sharp)
+                Marca de agua por defecto
               </label>
               <select
                 value={defaultWatermarkMode}
@@ -638,7 +653,7 @@ function ArtistDashboardPage() {
                   <p className="text-sm font-bold text-sky-950">🇦🇷 Mercado Pago Marketplace Split (ARS)</p>
                   <p className="text-xs text-sky-800">
                     {hasMP
-                      ? "✅ Cuenta vinculada (tokens cifrados con AES-256-GCM)"
+                      ? "✅ Cuenta vinculada"
                       : "Recibí pesos argentinos directo en tu cuenta de Mercado Pago."}
                   </p>
                   {paymentsMode === "mock" && (

@@ -14,6 +14,7 @@ export default function RegisterPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [isArtist, setIsArtist] = useState(true);
   const [acceptedAntiAi, setAcceptedAntiAi] = useState(false);
+  const [acceptedTerms, setAcceptedTerms] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [verifyPending, setVerifyPending] = useState(false);
@@ -21,6 +22,10 @@ export default function RegisterPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!acceptedTerms) {
+      setError("Para crear la cuenta tenés que ser mayor de 18 años y aceptar los Términos y la Política de Privacidad.");
+      return;
+    }
     if (isArtist && !acceptedAntiAi) {
       setError("Para abrir un puestito de artista debés aceptar la declaración de Arte 100% Humano.");
       return;
@@ -217,6 +222,15 @@ export default function RegisterPage() {
               </span>
             </label>
           )}
+
+          <label className="flex cursor-pointer items-start gap-2.5 text-xs text-slate-700">
+            <input type="checkbox" required checked={acceptedTerms} onChange={(e) => setAcceptedTerms(e.target.checked)} className="mt-0.5 h-4 w-4" />
+            <span>
+              Soy mayor de 18 años y acepto los{" "}
+              <Link href="/terms" target="_blank" className="font-semibold text-purple-700 underline">Términos y Condiciones</Link> y la{" "}
+              <Link href="/privacy" target="_blank" className="font-semibold text-purple-700 underline">Política de Privacidad</Link>.
+            </span>
+          </label>
 
           <button
             type="submit"
