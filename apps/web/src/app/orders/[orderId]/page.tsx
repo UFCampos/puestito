@@ -6,6 +6,7 @@ import Link from "next/link";
 import { apiFetch, API_URL, fileTooLarge, resolveImageUrl } from "../../../lib/api";
 import { useAppConfig } from "../../../lib/useAppConfig";
 import { MilestoneActions, MilestoneTimeline, type OrderMilestoneView } from "../../../components/MilestonePanel";
+import { DeadlineNotice, DisputePanel, OrderHelpCard } from "../../../components/order/OrderResolution";
 
 const IMAGE_EXT = /\.(png|jpe?g|webp)$/i;
 const DELIVERY_EXT = /\.(png|jpe?g|webp|zip|rar|psd)$/i;
@@ -44,6 +45,7 @@ const STATUS_BADGE: Record<string, { text: string; color: string }> = {
   MILESTONE_WAITING_PAYMENT: { text: "Etapa aprobada • Esperando el pago de la siguiente", color: "bg-pink-50 text-pink-700 border-pink-200" },
   MILESTONE_IN_PROGRESS: { text: "Etapa paga • En proceso", color: "bg-blue-50 text-blue-700 border-blue-200" },
   MILESTONE_REVIEW: { text: "Etapa entregada • Esperando aprobación", color: "bg-purple-50 text-purple-700 border-purple-200" },
+  DISPUTED: { text: "En reclamo • Pedido en pausa", color: "bg-amber-50 text-amber-800 border-amber-300" },
 };
 
 export default function OrderWorkspacePageWrapper() {
@@ -68,6 +70,24 @@ function OrderWorkspacePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [actionLoading, setActionLoading] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const [, setPulse] = useState("");
+  const cfg = useAppConfig();
+
+  /** Ejecuta una acción de la sala: bloquea botones, muestra el error en pantalla y recarga */
+  async function runAction(action: () => Promise<unknown>, confirmText?: string) {
+    if (confirmText && !confirm(confirmText)) return;
+    setActionLoading(true);
+    setActionError("");
+    try {
+      await action();
+      await loadOrder();
+    } catch (err: any) {
+      setActionError(err.message || "No se pudo completar la acción");
+    } finally {
+      setActionLoading(false);
+    }
+  }
 
   // Message state
   const [messageText, setMessageText] = useState("");
@@ -81,7 +101,7 @@ function OrderWorkspacePage() {
   const [finalFile, setFinalFile] = useState<File | null>(null);
   const [finalPreviewFile, setFinalPreviewFile] = useState<File | null>(null);
   const [uploadError, setUploadError] = useState("");
-  const limits = useAppConfig().uploadLimitsMb;
+  const limits = cfg.uploadLimitsMb;
   // Un .zip / .rar / .psd no se puede previsualizar: hace falta una imagen aparte
   const finalNeedsPreview = Boolean(finalFile && !IMAGE_EXT.test(finalFile.name));
 
@@ -150,6 +170,29 @@ function OrderWorkspacePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paymentNotice]);
 
+  useEffect(() => {
+    if (!orderId) return;
+    let loadedAt = Date.now();
+    const t = setInterval(async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const { version } = await apiFetch<{ version: string }>(`/api/orders/${orderId}/pulse`);
+        setPulse((prev) => {
+          // Las URLs firmadas vencen a los 15 min: a los 10 se refresca aunque no haya novedades
+          if ((prev && prev !== version) || Date.now() - loadedAt > 10 * 60_000) {
+            loadedAt = Date.now();
+            void loadOrder();
+          }
+          return version;
+        });
+      } catch {
+        // sin conexión: se reintenta en el próximo ciclo
+      }
+    }, 15000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderId]);
+
   const lastPaidAt = (payload?.payments || [])
     .filter((p: any) => p.status === "APPROVED" && p.paidAt)
     .map((p: any) => new Date(p.paidAt).getTime())
@@ -162,7 +205,6 @@ function OrderWorkspacePage() {
   }, [lastPaidAt, paymentNotice]);
 
   const order = payload?.order;
-  const service = payload?.service;
   const artist = payload?.artist;
   const buyer = payload?.buyer;
   const isArtist = Boolean(payload?.isArtist);
@@ -170,6 +212,12 @@ function OrderWorkspacePage() {
   const messages = payload?.messages || [];
   const payments = payload?.payments || [];
   const review = payload?.review;
+  const dispute = payload?.dispute ?? null;
+  const permissions = payload?.permissions;
+  const deadlines = payload?.deadlines;
+  const isStaff = Boolean(payload?.isStaffView);
+  const supportEmail: string = payload?.supportEmail || cfg.supportEmail;
+  const paidAmount: number = payload?.paidAmount ?? 0;
 
   async function handleAcceptOrder() {
     setActionLoading(true);
@@ -177,7 +225,7 @@ function OrderWorkspacePage() {
       await apiFetch(`/api/orders/${orderId}/accept`, { method: "POST" });
       await loadOrder();
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -193,7 +241,7 @@ function OrderWorkspacePage() {
       });
       await loadOrder();
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -205,7 +253,7 @@ function OrderWorkspacePage() {
       const { url } = await apiFetch<{ url: string }>(`/api/orders/${orderId}/download-hd`);
       window.location.href = url;
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -218,7 +266,7 @@ function OrderWorkspacePage() {
       await apiFetch(`/api/orders/${orderId}/cancel`, { method: "POST" });
       await loadOrder();
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -232,7 +280,7 @@ function OrderWorkspacePage() {
       });
       window.location.href = res.initPoint;
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
       setActionLoading(false);
     }
   }
@@ -249,7 +297,7 @@ function OrderWorkspacePage() {
       setMessageText("");
       await loadOrder();
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -278,7 +326,7 @@ function OrderWorkspacePage() {
       setSketchFile(null);
       await loadOrder();
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -290,7 +338,7 @@ function OrderWorkspacePage() {
       await apiFetch(`/api/orders/${orderId}/approve-sketch`, { method: "POST" });
       await loadOrder();
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -310,7 +358,7 @@ function OrderWorkspacePage() {
       setChangeFeedback("");
       await loadOrder();
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -345,7 +393,7 @@ function OrderWorkspacePage() {
       setFinalPreviewFile(null);
       await loadOrder();
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -357,7 +405,7 @@ function OrderWorkspacePage() {
       await apiFetch(`/api/orders/${orderId}/approve-final-preview`, { method: "POST" });
       await loadOrder();
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -373,7 +421,7 @@ function OrderWorkspacePage() {
       });
       await loadOrder();
     } catch (err: any) {
-      alert(err.message);
+      setActionError(err.message);
     } finally {
       setActionLoading(false);
     }
@@ -404,7 +452,9 @@ function OrderWorkspacePage() {
   const STATUS_STEPS = stepsFor(order.paymentPlanSnapshot);
   const isMilestonePlan = order.paymentPlanSnapshot === "MILESTONES";
   const orderMilestones: OrderMilestoneView[] = payload?.milestones || [];
-  const currentStepIdx = STATUS_STEPS.findIndex((s) => s.key === order.status);
+  // Con un reclamo abierto, el paso a paso muestra dónde quedó en pausa el pedido
+  const flowStatus: string = order.flowStatus || order.status;
+  const currentStepIdx = STATUS_STEPS.findIndex((s) => s.key === flowStatus);
   const revisionsIncluded = order.serviceSnapshot?.revisionsIncluded ?? 0;
   const revisionsLeft = Math.max(0, revisionsIncluded - (order.revisionsUsed ?? 0));
   const depositDeadline = payload?.depositExpiresAt ? new Date(payload.depositExpiresAt) : null;
@@ -430,6 +480,15 @@ function OrderWorkspacePage() {
         </div>
       )}
 
+      {isStaff && (
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-purple-300 bg-purple-50 px-5 py-4 text-purple-950">
+          <p className="text-sm font-bold">🛡️ Estás viendo este pedido como parte del equipo de TuPuestito. Podés escribir en el hilo.</p>
+          <Link href="/admin?tab=reclamos" className="text-xs font-bold text-purple-700 underline">
+            Volver a moderación
+          </Link>
+        </div>
+      )}
+
       {/* Top Header */}
       <div className="flex flex-wrap items-start justify-between gap-4 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
         <div>
@@ -442,8 +501,13 @@ function OrderWorkspacePage() {
             </span>
           </div>
           <h1 className="mt-2 text-2xl font-extrabold text-slate-900">
-            {service?.title || "Comisión Personalizada"}
+            {order.serviceSnapshot?.title || "Comisión Personalizada"}
           </h1>
+          {order.addonsSnapshot?.length > 0 && (
+            <p className="mt-1 text-xs text-slate-500">
+              Extras: {order.addonsSnapshot.map((a: any) => a.name).join(" · ")}
+            </p>
+          )}
           <div className="mt-2 flex flex-wrap items-center gap-4 text-sm text-slate-600">
             <span>
               🎨 Artista:{" "}
@@ -476,8 +540,8 @@ function OrderWorkspacePage() {
       {isMilestonePlan && <MilestoneTimeline milestones={orderMilestones} />}
       <div className={`mt-6 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8 ${isMilestonePlan ? "hidden" : ""}`}>
         {STATUS_STEPS.map((s, idx) => {
-          const isCompleted = currentStepIdx >= 0 && (idx < currentStepIdx || order.status === "COMPLETED_HD_UNLOCKED");
-          const isCurrent = order.status === s.key;
+          const isCompleted = currentStepIdx >= 0 && (idx < currentStepIdx || flowStatus === "COMPLETED_HD_UNLOCKED");
+          const isCurrent = flowStatus === s.key;
           return (
             <div
               key={s.key}
@@ -501,7 +565,37 @@ function OrderWorkspacePage() {
         <div className="space-y-6 lg:col-span-2">
           {/* ACTION PANEL BY STATUS & ROLE */}
           <div className="rounded-3xl border-2 border-purple-200 bg-gradient-to-br from-purple-50/70 via-white to-pink-50/40 p-6 shadow-sm">
-            <h2 className="text-base font-bold text-slate-900">⚡ Próxima acción requerida</h2>
+            <h2 className="text-base font-bold text-slate-900">
+              {order.status === "DISPUTED" ? "⏸️ Pedido en pausa por un reclamo" : "⚡ Próxima acción requerida"}
+            </h2>
+            {actionError && (
+              <div role="alert" className="mt-3 flex items-start justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-800">
+                <span>⚠️ {actionError}</span>
+                <button type="button" onClick={() => setActionError("")} aria-label="Cerrar aviso" className="text-rose-500">
+                  ✕
+                </button>
+              </div>
+            )}
+            {order.status === "DISPUTED" && dispute && permissions && (
+              <DisputePanel
+                orderId={orderId}
+                busy={actionLoading}
+                run={runAction}
+                dispute={dispute}
+                permissions={permissions}
+                payments={payments}
+                paidAmount={paidAmount}
+                isBuyer={isBuyer}
+                isArtist={isArtist}
+                supportEmail={supportEmail}
+              />
+            )}
+            {!isStaff && <DeadlineNotice status={order.status} deadlines={deadlines} isBuyer={isBuyer} />}
+            {isStaff && order.status !== "DISPUTED" && (
+              <p className="mt-3 text-sm text-slate-600">Estado actual: {badge.text}.</p>
+            )}
+            {!isStaff && (
+            <>
 
             {/* 1. REQUESTED */}
             {order.status === "REQUESTED" && (
@@ -907,8 +1001,12 @@ function OrderWorkspacePage() {
             {(order.status === "REJECTED" || order.status === "EXPIRED" || order.status === "CANCELLED") && (
               <p className="mt-3 text-sm text-slate-600">
                 {order.status === "REJECTED" && "El artista rechazó esta solicitud. No se realizó ningún cobro."}
-                {order.status === "EXPIRED" && "El pedido venció porque no se registró el pago inicial a tiempo. Si todavía te interesa, podés enviar una nueva solicitud."}
-                {order.status === "CANCELLED" && "Este pedido fue cancelado antes de cualquier pago."}
+                {order.status === "EXPIRED" &&
+                  (order.acceptedAt
+                    ? "El pedido venció porque no se registró el pago inicial a tiempo. Si todavía te interesa, podés enviar una nueva solicitud."
+                    : "La solicitud venció porque el artista no respondió a tiempo. No se realizó ningún cobro.")}
+                {order.status === "CANCELLED" && "Este pedido fue cancelado. El detalle (y los reembolsos, si los hubo) está en el hilo, más abajo."}
+                {order.filesPurgedAt && " Los archivos de este pedido ya se eliminaron."}
               </p>
             )}
 
@@ -924,6 +1022,8 @@ function OrderWorkspacePage() {
                 revisionsLeft={revisionsLeft}
                 revisionsIncluded={revisionsIncluded}
                 limits={limits}
+                deadlines={deadlines}
+                onError={setActionError}
                 busy={actionLoading}
                 setBusy={setActionLoading}
                 reload={loadOrder}
@@ -934,7 +1034,13 @@ function OrderWorkspacePage() {
             {/* 9. COMPLETED_HD_UNLOCKED */}
             {order.status === "COMPLETED_HD_UNLOCKED" && (
               <div className="mt-3 space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+                {!order.hdUnlocked && (
+                  <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-900">
+                    <p className="font-bold">🔒 La descarga del original quedó bloqueada</p>
+                    <p className="mt-1 text-xs">Uno de los pagos fue reembolsado o tuvo un contracargo. Si creés que es un error, escribinos a {supportEmail}.</p>
+                  </div>
+                )}
+                <div className={`flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 ${order.hdUnlocked ? "" : "hidden"}`}>
                   <div>
                     <p className="text-sm font-bold text-emerald-950">
                       🔓 ¡Archivo Original HD Desbloqueado!
@@ -999,6 +1105,8 @@ function OrderWorkspacePage() {
                 )}
               </div>
             )}
+            </>
+            )}
           </div>
 
           {/* MESSAGE THREAD / TIMELINE */}
@@ -1046,7 +1154,7 @@ function OrderWorkspacePage() {
               })}
             </div>
 
-            {!["CANCELLED", "REJECTED", "EXPIRED"].includes(order.status) && (
+            {(isStaff || !["CANCELLED", "REJECTED", "EXPIRED"].includes(order.status)) && (
               <form onSubmit={handleSendMessage} className="mt-4 flex gap-2 border-t border-slate-100 pt-4">
                 <input
                   type="text"
@@ -1141,13 +1249,17 @@ function OrderWorkspacePage() {
                     </div>
                     <div className="mt-1 flex items-center justify-between text-[11px] text-slate-500">
                       <span>
-                        Neto Artista: ${(Number(m.grossAmount) - Number(m.marketplaceFee)).toLocaleString("es-AR")} • Fee 5%: $
+                        Neto Artista: ${(Number(m.grossAmount) - Number(m.marketplaceFee)).toLocaleString("es-AR")} • Comisión {cfg.platformFeePercent}%: $
                         {Number(m.marketplaceFee).toLocaleString("es-AR")}
                       </span>
                       <span
                         className={`rounded-full px-2 py-0.5 font-bold ${
                           m.status === "APPROVED"
                             ? "bg-emerald-100 text-emerald-700"
+                            : m.status === "REFUNDED" || m.status === "CHARGED_BACK"
+                            ? "bg-rose-100 text-rose-700"
+                            : m.status === "REJECTED"
+                            ? "bg-slate-200 text-slate-600"
                             : "bg-amber-100 text-amber-700"
                         }`}
                       >
@@ -1159,6 +1271,22 @@ function OrderWorkspacePage() {
               </div>
             )}
           </div>
+
+          {!isStaff && permissions && (
+            <OrderHelpCard
+              orderId={orderId}
+              busy={actionLoading}
+              run={runAction}
+              order={order}
+              dispute={dispute}
+              permissions={permissions}
+              deadlines={deadlines}
+              paidAmount={paidAmount}
+              isBuyer={isBuyer}
+              supportEmail={supportEmail}
+              paymentTimeoutDays={cfg.paymentTimeoutDays}
+            />
+          )}
 
           {/* Immutable Terms Snapshot */}
           <div className="rounded-3xl border border-slate-200 bg-slate-50 p-5">
