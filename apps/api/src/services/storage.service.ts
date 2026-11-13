@@ -7,7 +7,8 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
-  HeadObjectCommand
+  HeadObjectCommand,
+  ListObjectsV2Command
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { config } from "../config.js";
@@ -186,6 +187,45 @@ export const storage = {
     const file = localPath(visibility, key);
     await fs.rm(file, { force: true });
     await fs.rm(`${file}.meta`, { force: true });
+  },
+
+  /** Recorre los objetos bajo un prefijo (para la limpieza de archivos huérfanos) */
+  async *list(visibility: Visibility, prefix: string): AsyncGenerator<{ key: string; lastModified: Date }> {
+    if (s3) {
+      let token: string | undefined;
+      do {
+        const page = await s3.send(
+          new ListObjectsV2Command({ Bucket: bucketFor(visibility), Prefix: prefix, ContinuationToken: token })
+        );
+        for (const obj of page.Contents ?? []) {
+          if (obj.Key) yield { key: obj.Key, lastModified: obj.LastModified ?? new Date() };
+        }
+        token = page.IsTruncated ? page.NextContinuationToken : undefined;
+      } while (token);
+      return;
+    }
+    const root = path.join(localRoot, visibility);
+    const walk = async function* (dir: string): AsyncGenerator<{ key: string; lastModified: Date }> {
+      const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) yield* walk(full);
+        else if (!entry.name.endsWith(".meta")) {
+          const stat = await fs.stat(full).catch(() => null);
+          if (stat) yield { key: path.relative(root, full).split(path.sep).join("/"), lastModified: stat.mtime };
+        }
+      }
+    };
+    yield* walk(path.join(root, ...prefix.split("/").filter(Boolean)));
+  },
+
+  /** Key de un archivo nuestro a partir de su URL pública (null si la URL es externa) */
+  keyFromPublicUrl(url: string | null | undefined): string | null {
+    if (!url) return null;
+    const base = s3 ? `${config.R2_PUBLIC_URL!.replace(/\/$/, "")}/` : `${config.API_URL}/files/public/`;
+    if (!url.startsWith(base)) return null;
+    const key = url.slice(base.length);
+    return isSafeKey(key) ? key : null;
   },
 
   /** URL pública permanente (solo bucket público) */

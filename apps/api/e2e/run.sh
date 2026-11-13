@@ -16,6 +16,12 @@ export DATABASE_POOL_MAX=1
 export STORAGE_DRIVER=local LOCAL_STORAGE_DIR="$E2E_STORAGE"
 export PAYMENTS_MODE=mock NODE_ENV=development
 export MAX_FINAL_DELIVERY_MB=2   # límite chico para poder probar el rechazo por tamaño
+# Lo que necesitan los tests de lanzamiento (e2e/launch.mjs):
+export RELAX_RATE_LIMITS=true            # hacen en segundos lo que una persona hace en días
+export JOBS_INTERVAL_MINUTES=0           # los plazos automáticos se corren a mano, simulando la fecha
+export ADMIN_EMAILS=kaito@tupuestito.com # prueba el alta de admins por configuración
+export PAYMENT_TIMEOUT_DAYS=0.00006      # ~5 s: permite probar el cierre por falta de pago
+export ORDER_FILES_RETENTION_DAYS=1
 
 if curl -s -o /dev/null "http://localhost:$E2E_API_PORT/health"; then
   echo "❌ Ya hay algo escuchando en :$E2E_API_PORT. Cerralo antes de correr los tests." >&2
@@ -38,4 +44,8 @@ for _ in $(seq 1 60); do
 done
 if [ "$READY" != 1 ]; then echo "❌ La API de test no levantó:" >&2; tail -20 /tmp/tp-api.log >&2; exit 1; fi
 
-node e2e/flow.mjs
+STATUS=0
+node e2e/flow.mjs || STATUS=1
+node e2e/launch.mjs || STATUS=1
+if [ "$STATUS" != 0 ]; then echo "── Últimas líneas del log de la API ──" >&2; tail -30 /tmp/tp-api.log >&2; fi
+exit $STATUS

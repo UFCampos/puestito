@@ -32,7 +32,8 @@ export const CommissionOrderStatusSchema = z.enum([
   "CANCELLED",
   "MILESTONE_WAITING_PAYMENT",
   "MILESTONE_IN_PROGRESS",
-  "MILESTONE_REVIEW"
+  "MILESTONE_REVIEW",
+  "DISPUTED"
 ]);
 export type CommissionOrderStatus = z.infer<typeof CommissionOrderStatusSchema>;
 

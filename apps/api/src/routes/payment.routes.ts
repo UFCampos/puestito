@@ -13,7 +13,7 @@ import { config, isProd } from "../config.js";
 import { HttpError, parseBody, requireArtist, requireUser } from "../lib/http.js";
 import { encryptSecret, hmac, safeEqual } from "../services/crypto.service.js";
 import { MercadoPagoService, pkcePair } from "../services/mercadopago.service.js";
-import { applyMpPayment, getArtistMpToken } from "../services/order.service.js";
+import { applyMpPayment, getArtistMpToken } from "../services/payments.service.js";
 import { notifyDiscord, html } from "../services/notification.service.js";
 
 const OAUTH_COOKIE = "tp_mp_oauth";
@@ -253,15 +253,19 @@ button{width:100%;padding:.9rem;border:0;border-radius:8px;font-weight:700;font-
         .where(eq(orderMilestonePayments.id, body.milestoneId ?? "00000000-0000-0000-0000-000000000000"))
         .limit(1);
       if (!row || row.o.buyerId !== user.id) throw new HttpError(404, "Pago no encontrado");
-      const approved = body.result === "approved";
+      // Además de aprobar o rechazar, permite simular lo que Mercado Pago puede informar después:
+      // un reembolso, un contracargo o un reclamo del comprador (lo usan los tests e2e).
+      const SIMULATED = ["approved", "rejected", "refunded", "charged_back", "in_mediation"] as const;
+      const status = SIMULATED.find((s) => s === body.result) ?? "rejected";
       await applyMpPayment({
-        id: Math.floor(1e9 + Math.random() * 9e9),
-        status: approved ? "approved" : "rejected",
+        // Un pago ya acreditado conserva su número al simular lo que le pasa después
+        id: row.m.mpPaymentId ? Number(row.m.mpPaymentId) : Math.floor(1e9 + Math.random() * 9e9),
+        status,
         external_reference: row.m.id,
         transaction_amount: row.m.grossAmount,
         currency_id: "ARS"
       });
-      return reply.redirect(`${config.WEB_URL}/orders/${row.o.id}?payment=${approved ? "success" : "failure"}`);
+      return reply.redirect(`${config.WEB_URL}/orders/${row.o.id}?payment=${status === "approved" ? "success" : "failure"}`);
     });
   }
 

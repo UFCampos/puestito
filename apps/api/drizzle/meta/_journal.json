@@ -15,6 +15,13 @@
       "when": 1794406441808,
       "tag": "0001_milestones",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794560143789,
+      "tag": "0002_launch_readiness",
+      "breakpoints": true
     }
   ]
 }

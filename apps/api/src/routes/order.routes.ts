@@ -16,6 +16,7 @@ import {
   commissionAddons,
   commissionOrders,
   commissionServices,
+  orderDisputes,
   orderMessages,
   orderMilestonePayments,
   reviews,
@@ -23,49 +24,112 @@ import {
 } from "../db/schema.js";
 import { config } from "../config.js";
 import { HttpError, parseBody, requireUser, type SessionUser } from "../lib/http.js";
-import { MAX_REFERENCE_BYTES, extensionFor, newKey, storage } from "../services/storage.service.js";
+import { assertStatus, loadOrderFor } from "../lib/order-access.js";
+import { MAX_REFERENCE_BYTES, newKey, storage } from "../services/storage.service.js";
 import { DELIVERY_FORMATS, LIMITS, LIMITS_MB, sniffArchive } from "../lib/limits.js";
 import { WatermarkService } from "../services/watermark.service.js";
 import { MercadoPagoService, MercadoPagoError } from "../services/mercadopago.service.js";
-import { notifyDiscord } from "../services/notification.service.js";
+import { notifyDiscord, sendEmail, html } from "../services/notification.service.js";
 import { loadAvatar } from "./artist.routes.js";
+import { artistCanCharge, getArtistMpToken } from "../services/payments.service.js";
 import {
+  DISPUTE_REASON_LABEL,
+  USER_DISPUTE_REASONS,
+  canOpenDispute,
+  getLatestDispute
+} from "../services/dispute.service.js";
+import {
+  ARTIST_ACTION_STATUSES,
+  BUYER_ACTION_STATUSES,
+  BUYER_PAYMENT_STATUSES,
+  PAID_ACTIVE_STATUSES,
   SLOT_STATUSES,
   addSystemMessage,
-  computeAmounts,
+  approveFinalPreview,
+  approveMilestone,
+  approveSketch,
   buildOrderMilestones,
-  pendingPayment,
-  planLabel,
-  getArtistMpToken,
+  cancelOrderTx,
+  computeAmounts,
   neutralTitle,
   nextOrderNumber,
   notifyOrder,
+  orderDeadlines,
+  orderParties,
+  pendingPayment,
+  planLabel,
+  platformRulesText,
   transition,
   type Order
 } from "../services/order.service.js";
 
-
-/** Carga el pedido y determina el rol del usuario; 404 si no participa (no revela existencia) */
-async function loadOrderFor(request: FastifyRequest, user: SessionUser) {
-  const { id } = request.params as { id: string };
-  if (!/^[0-9a-f-]{36}$/i.test(id)) throw new HttpError(404, "Pedido no encontrado");
-  const [row] = await db
-    .select({ order: commissionOrders, artistUserId: artistProfiles.userId, artistProfile: artistProfiles })
-    .from(commissionOrders)
-    .innerJoin(artistProfiles, eq(commissionOrders.artistId, artistProfiles.id))
-    .where(eq(commissionOrders.id, id))
-    .limit(1);
-  if (!row) throw new HttpError(404, "Pedido no encontrado");
-  const isBuyer = row.order.buyerId === user.id;
-  const isArtist = row.artistUserId === user.id;
-  const isAdmin = user.role === "ADMIN";
-  if (!isBuyer && !isArtist && !isAdmin) throw new HttpError(404, "Pedido no encontrado");
-  return { order: row.order, artistProfile: row.artistProfile, isBuyer, isArtist, isAdmin };
+/** Mensajes de la otra parte (o del sistema) posteriores a la última vez que este usuario abrió el pedido */
+function unreadSql(userId: string) {
+  return sql<boolean>`exists (
+    select 1 from ${orderMessages} m
+    where m.order_id = ${commissionOrders.id}
+      and (m.sender_id is null or m.sender_id <> ${userId})
+      and m.created_at > coalesce(
+        case when ${commissionOrders.buyerId} = ${userId} then ${commissionOrders.buyerSeenAt} else ${commissionOrders.artistSeenAt} end,
+        'epoch'::timestamptz
+      )
+  )`;
 }
 
-function assertStatus(order: Order, ...allowed: Order["status"][]) {
-  if (!allowed.includes(order.status)) {
-    throw new HttpError(409, "Esta acción no está disponible en el estado actual del pedido");
+/** Deja asentado que esta parte abrió la sala del pedido (no cuenta como actividad del pedido) */
+async function markSeen(orderId: string, side: "buyer" | "artist") {
+  await db
+    .update(commissionOrders)
+    .set({
+      ...(side === "buyer" ? { buyerSeenAt: new Date() } : { artistSeenAt: new Date() }),
+      updatedAt: sql`${commissionOrders.updatedAt}`
+    })
+    .where(eq(commissionOrders.id, orderId));
+}
+
+/**
+ * Aviso por email de un mensaje nuevo en el hilo. Como mucho uno por "tanda": no se vuelve a
+ * avisar hasta que la otra parte abra el pedido, y no se avisa si lo tiene abierto en este momento.
+ */
+async function notifyNewMessage(
+  order: Order,
+  from: "buyer" | "artist" | "staff",
+  sender: SessionUser,
+  content: string
+) {
+  try {
+    const sides = from === "staff" ? (["buyer", "artist"] as const) : from === "buyer" ? (["artist"] as const) : (["buyer"] as const);
+    const parties = await orderParties(order);
+    for (const side of sides) {
+      const seenAt = side === "buyer" ? commissionOrders.buyerSeenAt : commissionOrders.artistSeenAt;
+      const notifiedAt = side === "buyer" ? commissionOrders.buyerNotifiedAt : commissionOrders.artistNotifiedAt;
+      const [claimed] = await db
+        .update(commissionOrders)
+        .set({
+          ...(side === "buyer" ? { buyerNotifiedAt: new Date() } : { artistNotifiedAt: new Date() }),
+          updatedAt: sql`${commissionOrders.updatedAt}`
+        })
+        .where(
+          and(
+            eq(commissionOrders.id, order.id),
+            sql`(${notifiedAt} is null or ${seenAt} > ${notifiedAt})`,
+            sql`(${seenAt} is null or ${seenAt} < now() - interval '45 seconds')`
+          )
+        )
+        .returning({ id: commissionOrders.id });
+      const recipient = parties[side];
+      if (!claimed || !recipient || recipient.deletedAt) continue;
+      const who = from === "staff" ? "El equipo de TuPuestito" : `@${sender.username}`;
+      await sendEmail({
+        to: recipient.email,
+        subject: `Mensaje nuevo en tu pedido · #${order.orderNumber}`,
+        title: "Tenés un mensaje nuevo",
+        html: `<p>Hola ${html.escape(recipient.name)},</p><p>${html.escape(who)} te escribió en el pedido #${html.escape(order.orderNumber)}:</p><blockquote style="margin:12px 0;padding:10px 14px;border-left:3px solid #ddd6fe;background:#faf5ff;color:#475569">${html.escape(content.slice(0, 300))}${content.length > 300 ? "…" : ""}</blockquote><p style="font-size:12px;color:#64748b">No te vamos a avisar de cada mensaje: el próximo aviso llega después de que abras el pedido.</p>`,
+        cta: { label: "Responder en la sala del pedido", url: `${config.WEB_URL}/orders/${order.id}` }
+      });
+    }
+  } catch (err) {
+    console.error("[notify] No se pudo avisar del mensaje nuevo", order.orderNumber, err);
   }
 }
 
@@ -218,11 +282,17 @@ export async function orderRoutes(fastify: FastifyInstance) {
       .innerJoin(users, eq(artistProfiles.userId, users.id))
       .where(and(eq(commissionServices.id, body.serviceId), eq(commissionServices.isActive, true)))
       .limit(1);
-    if (!row) throw new HttpError(404, "Servicio de comisión no encontrado");
+    if (!row || row.service.moderatedAt || row.artistUser.suspendedAt || row.artistUser.deletedAt) {
+      throw new HttpError(404, "Servicio de comisión no encontrado");
+    }
     const { service, profile, artistUser } = row;
 
     if (artistUser.id === user.id) throw new HttpError(400, "No podés encargarte una comisión a vos mismo/a");
     if (profile.commissionStatus === "CLOSED") throw new HttpError(409, "El artista tiene las comisiones cerradas");
+    // Plan §2: el contenido +18 es solo para quien declaró ser mayor de edad
+    if (service.rating === "NSFW" && !user.showNsfw) {
+      throw new HttpError(403, "Esta comisión es +18. Activá el contenido adulto en tu cuenta (confirmando que sos mayor de edad) para poder pedirla.");
+    }
 
     // Precio calculado SIEMPRE en el servidor a partir de los addons reales
     const addons = body.addonIds.length
@@ -266,7 +336,9 @@ export async function orderRoutes(fastify: FastifyInstance) {
       `Modalidad de pago aceptada: ${agreedPlan}.`,
       service.paymentPlan === "MILESTONES"
         ? "El comprador entiende que el pago de cada etapa no es reembolsable una vez entregada esa etapa."
-        : "El comprador entiende que la seña inicial no es reembolsable una vez entregado el boceto."
+        : "El comprador entiende que la seña inicial no es reembolsable una vez entregado el boceto.",
+      "",
+      platformRulesText()
     ].join("\n");
 
     const order = await db.transaction(async (tx) => {
@@ -325,7 +397,8 @@ export async function orderRoutes(fastify: FastifyInstance) {
         buyerName: buyer.name,
         buyerUsername: buyer.username,
         artistName: users.name,
-        artistUsername: users.username
+        artistUsername: users.username,
+        unread: unreadSql(user.id)
       })
       .from(commissionOrders)
       .innerJoin(buyer, eq(commissionOrders.buyerId, buyer.id))
@@ -340,23 +413,30 @@ export async function orderRoutes(fastify: FastifyInstance) {
       .limit(200);
 
     return {
-      orders: rows.map((r) => ({
-        id: r.order.id,
-        orderNumber: r.order.orderNumber,
-        status: r.order.status,
-        paymentPlanSnapshot: r.order.paymentPlanSnapshot,
-        totalAmount: r.order.totalAmount,
-        currency: r.order.currency,
-        buyerBrief: r.order.buyerBrief,
-        createdAt: r.order.createdAt,
-        updatedAt: r.order.updatedAt,
-        serviceTitle: r.order.serviceSnapshot.title,
-        buyerName: r.buyerName,
-        buyerUsername: r.buyerUsername,
-        artistName: r.artistName,
-        artistUsername: r.artistUsername,
-        role: r.order.buyerId === user.id ? "BUYER" : "ARTIST"
-      }))
+      orders: rows.map((r) => {
+        const role = r.order.buyerId === user.id ? ("BUYER" as const) : ("ARTIST" as const);
+        return {
+          id: r.order.id,
+          orderNumber: r.order.orderNumber,
+          status: r.order.status,
+          paymentPlanSnapshot: r.order.paymentPlanSnapshot,
+          totalAmount: r.order.totalAmount,
+          currency: r.order.currency,
+          buyerBrief: r.order.buyerBrief,
+          createdAt: r.order.createdAt,
+          updatedAt: r.order.updatedAt,
+          serviceTitle: r.order.serviceSnapshot.title,
+          buyerName: r.buyerName,
+          buyerUsername: r.buyerUsername,
+          artistName: r.artistName,
+          artistUsername: r.artistUsername,
+          role,
+          // "Te toca a vos": la próxima acción del pedido es de este usuario
+          awaitingMe: (role === "BUYER" ? BUYER_ACTION_STATUSES : ARTIST_ACTION_STATUSES).includes(r.order.status),
+          unread: Boolean(r.unread),
+          workDueAt: orderDeadlines(r.order).workDueAt
+        };
+      })
     };
   });
 
@@ -365,7 +445,13 @@ export async function orderRoutes(fastify: FastifyInstance) {
   // ───────────────────────────────────────────────────────────
   fastify.get("/:id", async (request) => {
     const user = await requireUser(request);
-    const { order, artistProfile, isBuyer, isArtist } = await loadOrderFor(request, user);
+    const { order, artistProfile, isBuyer, isArtist, isAdmin } = await loadOrderFor(request, user);
+    if (isBuyer || isArtist) await markSeen(order.id, isBuyer ? "buyer" : "artist");
+    const dispute = await getLatestDispute(order.id);
+    const openDispute = dispute?.status === "OPEN" ? dispute : null;
+    // Con un reclamo abierto, el flujo se muestra según el estado en que quedó en pausa
+    const flowStatus = order.status === "DISPUTED" && openDispute ? openDispute.statusBefore : order.status;
+    const role = isBuyer ? "BUYER" : isArtist ? "ARTIST" : null;
 
     const [buyer] = await db
       .select({ id: users.id, displayName: users.name, username: users.username, avatarUrl: users.image })
@@ -414,12 +500,29 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const signedMessages = await Promise.all(
       messages.map(async (m) => ({ ...m, attachments: await signAll(m.attachments) }))
     );
-    const hdUnlocked = order.status === "COMPLETED_HD_UNLOCKED";
+    const paidAmount = payments.filter((p) => p.status === "APPROVED").reduce((acc, p) => acc + p.grossAmount, 0);
+    // El original solo está disponible con el pedido completado Y el 100% todavía acreditado
+    const hdUnlocked = order.status === "COMPLETED_HD_UNLOCKED" && paidAmount >= order.totalAmount;
+    const deadlines = orderDeadlines(order);
+    const proposalIds = openDispute?.proposedRefundPaymentIds ?? null;
 
-    const { finalHdPrivateKey, sketchWatermarkedKey, previewWatermarkedKey, referenceImages, ...rest } = order;
+    const {
+      finalHdPrivateKey,
+      sketchWatermarkedKey,
+      previewWatermarkedKey,
+      referenceImages,
+      buyerSeenAt: _buyerSeenAt,
+      artistSeenAt: _artistSeenAt,
+      buyerNotifiedAt: _buyerNotifiedAt,
+      artistNotifiedAt: _artistNotifiedAt,
+      reminderStage: _reminderStage,
+      ...rest
+    } = order;
     return {
       order: {
         ...rest,
+        // Estado del flujo sin contar la pausa del reclamo (para el paso a paso)
+        flowStatus,
         referenceImages: await signAll(referenceImages),
         sketchWatermarkedUrl: sketchWatermarkedKey ? await storage.signedGetUrl(sketchWatermarkedKey) : null,
         previewWatermarkedUrl: previewWatermarkedKey ? await storage.signedGetUrl(previewWatermarkedKey) : null,
@@ -430,35 +533,111 @@ export async function orderRoutes(fastify: FastifyInstance) {
         const p = pendingPayment(order);
         return p ? { stage: p.stage, milestoneIndex: p.milestoneIndex, amount: p.amount } : null;
       })(),
-      depositExpiresAt:
-        order.status === "ACCEPTED_WAITING_DEPOSIT" && order.acceptedAt
-          ? new Date(order.acceptedAt.getTime() + config.DEPOSIT_EXPIRATION_HOURS * 3600_000)
-          : null,
+      depositExpiresAt: deadlines.depositExpiresAt,
+      // Fechas límite del estado actual: vencimientos, aprobación automática y entrega estimada
+      deadlines,
       // Plan por etapas: estado de cada una, derivado del pedido y de sus pagos
       milestones: order.milestonesSnapshot.map((m, i) => {
         const paid = payments.some((p) => p.stage === "MILESTONE" && p.milestoneIndex === i && p.status === "APPROVED");
         const state =
-          order.status === "COMPLETED_HD_UNLOCKED" || i < order.currentMilestone
+          flowStatus === "COMPLETED_HD_UNLOCKED" || i < order.currentMilestone
             ? "APPROVED"
-            : i > order.currentMilestone || ["REQUESTED", "REJECTED", "CANCELLED", "EXPIRED"].includes(order.status)
+            : i > order.currentMilestone || ["REQUESTED", "REJECTED", "CANCELLED", "EXPIRED"].includes(flowStatus)
             ? "UPCOMING"
-            : order.status === "MILESTONE_REVIEW"
+            : flowStatus === "MILESTONE_REVIEW"
             ? "IN_REVIEW"
-            : order.status === "MILESTONE_IN_PROGRESS"
+            : flowStatus === "MILESTONE_IN_PROGRESS"
             ? "IN_PROGRESS"
             : paid
             ? "IN_PROGRESS"
             : "WAITING_PAYMENT";
         return { ...m, index: i, paid, state };
       }),
+      // Reclamo abierto o, si ya se cerró, cómo terminó el último
+      dispute: dispute
+        ? {
+            id: dispute.id,
+            status: dispute.status,
+            reason: dispute.reason,
+            reasonLabel: DISPUTE_REASON_LABEL[dispute.reason],
+            description: dispute.description,
+            openerRole: dispute.openerRole,
+            openedByMe: dispute.openedById === user.id,
+            statusBefore: dispute.statusBefore,
+            createdAt: dispute.createdAt,
+            proposal: proposalIds
+              ? {
+                  paymentIds: proposalIds,
+                  amount: payments.filter((p) => proposalIds.includes(p.id)).reduce((acc, p) => acc + p.grossAmount, 0),
+                  proposedAt: dispute.proposedAt
+                }
+              : null,
+            resolution: dispute.resolution,
+            resolutionNote: dispute.resolutionNote,
+            resolvedAt: dispute.resolvedAt
+          }
+        : null,
+      // Qué puede hacer este usuario ahora mismo para destrabar el pedido
+      permissions: {
+        canOpenDispute: Boolean(role) && order.status !== "DISPUTED" && canOpenDispute(order, role!),
+        disputeReasons: role ? USER_DISPUTE_REASONS[role].map((r) => ({ value: r, label: DISPUTE_REASON_LABEL[r] })) : [],
+        canWithdrawDispute: Boolean(openDispute && openDispute.openedById === user.id),
+        canRefund: isArtist && paidAmount > 0 && (order.status === "DISPUTED" || PAID_ACTIVE_STATUSES.includes(order.status)),
+        canProposePartialRefund: isArtist && order.status === "DISPUTED" && paidAmount > 0,
+        canAnswerProposal: isBuyer && Boolean(proposalIds),
+        canCloseUnpaid:
+          isArtist &&
+          BUYER_PAYMENT_STATUSES.includes(order.status) &&
+          Boolean(deadlines.paymentTimeoutAt && deadlines.paymentTimeoutAt <= new Date())
+      },
+      paidAmount,
       buyer,
       artist: { id: artistProfile.id, ...artistUser, defaultWatermarkMode: artistProfile.defaultWatermarkMode },
       isBuyer,
       isArtist,
+      // Moderación mirando un pedido ajeno
+      isStaffView: isAdmin && !isBuyer && !isArtist,
       currentUserId: user.id,
+      supportEmail: config.SUPPORT_EMAIL,
       messages: signedMessages,
       payments,
       review: review ?? null
+    };
+  });
+
+  // ───────────────────────────────────────────────────────────
+  // GET /api/orders/:id/pulse — huella liviana del pedido: la sala la consulta cada pocos segundos
+  // y solo vuelve a pedir el detalle (con sus URLs firmadas) cuando algo cambió.
+  // ───────────────────────────────────────────────────────────
+  fastify.get("/:id/pulse", async (request) => {
+    const user = await requireUser(request);
+    const { order, isBuyer, isArtist } = await loadOrderFor(request, user);
+    if (isBuyer || isArtist) await markSeen(order.id, isBuyer ? "buyer" : "artist");
+    const [[messages], payments, [dispute]] = await Promise.all([
+      db
+        .select({ n: sql<number>`count(*)::int`, last: sql<string | null>`max(${orderMessages.createdAt})::text` })
+        .from(orderMessages)
+        .where(eq(orderMessages.orderId, order.id)),
+      db
+        .select({ id: orderMilestonePayments.id, status: orderMilestonePayments.status })
+        .from(orderMilestonePayments)
+        .where(eq(orderMilestonePayments.orderId, order.id))
+        .orderBy(asc(orderMilestonePayments.createdAt)),
+      db
+        .select({ last: sql<string | null>`max(${orderDisputes.updatedAt})::text` })
+        .from(orderDisputes)
+        .where(eq(orderDisputes.orderId, order.id))
+    ]);
+    return {
+      version: [
+        order.status,
+        order.statusChangedAt.getTime(),
+        order.revisionsUsed,
+        messages?.n ?? 0,
+        messages?.last ?? "",
+        payments.map((p) => p.status.slice(0, 3)).join(""),
+        dispute?.last ?? ""
+      ].join("|")
     };
   });
 
@@ -470,6 +649,10 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const { order, isArtist } = await loadOrderFor(request, user);
     if (!isArtist) throw new HttpError(403, "Solo el artista puede aceptar este pedido");
     assertStatus(order, "REQUESTED");
+    // Sin Mercado Pago vinculado el comprador no podría pagar y el pedido vencería solo
+    if (!(await artistCanCharge(order.artistId))) {
+      throw new HttpError(409, "Antes de aceptar pedidos tenés que vincular tu cuenta de Mercado Pago desde tu panel.");
+    }
 
     const updated = await db.transaction(async (tx) => {
       // Cupos: bloqueamos el servicio para contar sin carreras
@@ -512,17 +695,24 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const user = await requireUser(request);
     const { order, isArtist, isBuyer } = await loadOrderFor(request, user);
     if (!isArtist && !isBuyer) throw new HttpError(403, "No autorizado");
-    // Una vez acreditado un pago, la cancelación/reembolso pasa por soporte
-    assertStatus(order, "REQUESTED", "ACCEPTED_WAITING_DEPOSIT");
-    const updated = await db.transaction(async (tx) => {
-      const o = await transition(tx, order.id, ["REQUESTED", "ACCEPTED_WAITING_DEPOSIT"], "CANCELLED");
-      await tx
-        .update(orderMilestonePayments)
-        .set({ status: "REJECTED" })
-        .where(and(eq(orderMilestonePayments.orderId, order.id), eq(orderMilestonePayments.status, "PENDING")));
-      await addSystemMessage(tx, order.id, `🚫 El pedido fue cancelado por ${isArtist ? "el artista" : "el comprador"} antes de cualquier pago.`);
-      return o;
-    });
+    // Antes de cualquier pago se cancela libremente. Con un pago acreditado, la salida es un
+    // reembolso del artista o un reclamo (ver order-resolution.routes.ts).
+    if (order.status !== "REQUESTED" && order.status !== "ACCEPTED_WAITING_DEPOSIT") {
+      throw new HttpError(
+        409,
+        isArtist
+          ? "Este pedido ya tiene pagos acreditados. Podés cancelarlo reembolsando lo cobrado, o abrir un reclamo si hay un problema."
+          : "Este pedido ya tiene pagos acreditados. Para cancelarlo, abrí un reclamo desde la sala del pedido y acordalo con el artista."
+      );
+    }
+    const updated = await db.transaction((tx) =>
+      cancelOrderTx(
+        tx,
+        order.id,
+        ["REQUESTED", "ACCEPTED_WAITING_DEPOSIT"],
+        `🚫 El pedido fue cancelado por ${isArtist ? "el artista" : "el comprador"} antes de cualquier pago.`
+      )
+    );
     void notifyOrder(updated, isArtist ? "buyer" : "artist", "Pedido cancelado", `El pedido fue cancelado por ${isArtist ? "el artista" : "el comprador"}.`);
     return { ok: true, status: updated.status };
   });
@@ -611,13 +801,20 @@ export async function orderRoutes(fastify: FastifyInstance) {
   // ───────────────────────────────────────────────────────────
   fastify.post("/:id/messages", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request) => {
     const user = await requireUser(request);
-    const { order, isBuyer, isArtist } = await loadOrderFor(request, user);
-    if (!isBuyer && !isArtist) throw new HttpError(403, "Solo los participantes pueden escribir");
-    if (["REJECTED", "EXPIRED", "CANCELLED"].includes(order.status)) {
+    const { order, isBuyer, isArtist, isAdmin } = await loadOrderFor(request, user);
+    // Moderación puede intervenir en el hilo (por ejemplo, para mediar en un reclamo)
+    const isStaff = isAdmin && !isBuyer && !isArtist;
+    if (!isBuyer && !isArtist && !isStaff) throw new HttpError(403, "Solo los participantes pueden escribir");
+    if (!isStaff && ["REJECTED", "EXPIRED", "CANCELLED"].includes(order.status)) {
       throw new HttpError(409, "El hilo de este pedido está cerrado");
     }
     const { content } = parseBody(z.object({ content: z.string().trim().min(1).max(4000) }), request.body);
-    const [msg] = await db.insert(orderMessages).values({ orderId: order.id, senderId: user.id, type: "TEXT", content }).returning({ id: orderMessages.id });
+    const [msg] = await db
+      .insert(orderMessages)
+      .values({ orderId: order.id, senderId: user.id, type: "TEXT", content: isStaff ? `🛡️ Equipo de TuPuestito: ${content}` : content })
+      .returning({ id: orderMessages.id });
+    await db.update(commissionOrders).set({ updatedAt: new Date() }).where(eq(commissionOrders.id, order.id));
+    void notifyNewMessage(order, isStaff ? "staff" : isBuyer ? "buyer" : "artist", user, content);
     return { id: msg!.id, ok: true };
   });
 
@@ -702,19 +899,7 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const { order, isBuyer } = await loadOrderFor(request, user);
     if (!isBuyer) throw new HttpError(403, "Solo el comprador puede aprobar");
     assertStatus(order, "SKETCH_REVIEW");
-    const next = order.paymentPlanSnapshot === "SPLIT_ON_SKETCH" ? "WAITING_PAYMENT_AFTER_SKETCH" : "WORKING_FINAL";
-    const updated = await db.transaction(async (tx) => {
-      const o = await transition(tx, order.id, "SKETCH_REVIEW", next);
-      await addSystemMessage(
-        tx,
-        order.id,
-        next === "WAITING_PAYMENT_AFTER_SKETCH"
-          ? "✅ Boceto aprobado. Próximo paso: abonar el 50% restante para que el artista pase a línea y color."
-          : "✅ Boceto aprobado. El artista continúa con la obra final."
-      );
-      return o;
-    });
-    void notifyOrder(updated, "artist", "¡Boceto aprobado!", next === "WAITING_PAYMENT_AFTER_SKETCH" ? "El comprador aprobó el boceto y debe abonar el 50% restante." : "El comprador aprobó el boceto. Ya podés avanzar con la obra final.");
+    const updated = await approveSketch(order);
     return { ok: true, nextStatus: updated.status };
   });
 
@@ -833,36 +1018,7 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const { order, isBuyer } = await loadOrderFor(request, user);
     if (!isBuyer) throw new HttpError(403, "Solo el comprador puede aprobar una etapa");
     assertStatus(order, "MILESTONE_REVIEW");
-
-    const index = order.currentMilestone;
-    const total = order.milestonesSnapshot.length;
-    const isLast = index === total - 1;
-    const nextMilestone = order.milestonesSnapshot[index + 1];
-
-    const updated = await db.transaction(async (tx) => {
-      if (isLast) {
-        // Todas las etapas se pagan por adelantado: verificamos el 100% antes de liberar el original
-        const payments = await tx.select().from(orderMilestonePayments).where(eq(orderMilestonePayments.orderId, order.id));
-        const paid = payments.filter((p) => p.status === "APPROVED").reduce((acc, p) => acc + p.grossAmount, 0);
-        if (paid < order.totalAmount) throw new HttpError(409, "Todavía hay etapas sin pagar");
-        const o = await transition(tx, order.id, "MILESTONE_REVIEW", "COMPLETED_HD_UNLOCKED", { completedAt: new Date() });
-        await addSystemMessage(tx, order.id, "🎉 Etapa final aprobada. ¡Se desbloqueó la descarga del archivo original!");
-        return o;
-      }
-      const o = await transition(tx, order.id, "MILESTONE_REVIEW", "MILESTONE_WAITING_PAYMENT", { currentMilestone: index + 1 });
-      await addSystemMessage(
-        tx,
-        order.id,
-        `✅ Etapa ${index + 1}/${total} aprobada. Próximo paso: abonar la etapa ${index + 2} ("${nextMilestone!.title}", $${nextMilestone!.amount.toLocaleString("es-AR")} ARS) para que el artista la empiece.`
-      );
-      return o;
-    });
-    void notifyOrder(
-      updated,
-      "artist",
-      isLast ? "¡Pedido completado!" : `Etapa ${index + 1} aprobada`,
-      isLast ? "El comprador aprobó la etapa final." : "El comprador aprobó la etapa y debe abonar la siguiente para que puedas continuar."
-    );
+    const updated = await approveMilestone(order);
     return { ok: true, nextStatus: updated.status };
   });
 
@@ -872,12 +1028,7 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const { order, isBuyer } = await loadOrderFor(request, user);
     if (!isBuyer) throw new HttpError(403, "Solo el comprador puede aprobar la vista previa");
     assertStatus(order, "FINAL_PREVIEW_REVIEW");
-    const updated = await db.transaction(async (tx) => {
-      const o = await transition(tx, order.id, "FINAL_PREVIEW_REVIEW", "WAITING_PAYMENT_BEFORE_HD");
-      await addSystemMessage(tx, order.id, "✅ Vista previa final aprobada. Al acreditarse el 50% restante se desbloquea el original HD sin marca de agua.");
-      return o;
-    });
-    void notifyOrder(updated, "artist", "Vista previa aprobada", "El comprador aprobó la obra final y debe abonar el saldo.");
+    const updated = await approveFinalPreview(order);
     return { ok: true, nextStatus: updated.status };
   });
 

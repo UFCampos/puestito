@@ -1,19 +1,16 @@
-import { and, eq, inArray, lt, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { db, type DbOrTx } from "../db/index.js";
 import {
   artistProfiles,
   commissionOrders,
   orderMessages,
   orderMilestonePayments,
-  paymentAccounts,
   users,
   type OrderMilestone,
   type ServiceMilestone
 } from "../db/schema.js";
 import { config } from "../config.js";
-import { decryptSecret, encryptSecret } from "./crypto.service.js";
-import { MercadoPagoService, type MpPayment } from "./mercadopago.service.js";
-import { notifyDiscord, sendEmail, html } from "./notification.service.js";
+import { sendEmail, html } from "./notification.service.js";
 import { HttpError } from "../lib/http.js";
 
 export type Order = typeof commissionOrders.$inferSelect;
@@ -34,6 +31,17 @@ export function planLabel(plan: PaymentPlan, milestones: Pick<ServiceMilestone, 
   return `pago en ${milestones.length} etapas, cada una se abona antes de que el artista la empiece: ${list}`;
 }
 
+/** Reglas de plazos de la plataforma que el comprador acepta junto con los términos del artista */
+export function platformRulesText(): string {
+  return [
+    "Reglas de TuPuestito que aplican a este pedido:",
+    `• Si el comprador no revisa una entrega dentro de los ${config.REVIEW_AUTO_APPROVE_DAYS} días, se considera aprobada.`,
+    `• Si el comprador no abona una etapa dentro de los ${config.PAYMENT_TIMEOUT_DAYS} días, el artista puede cerrar el pedido sin reembolso de lo ya trabajado.`,
+    "• Con un pago acreditado, cualquiera de las partes puede abrir un reclamo desde la sala del pedido; mientras esté abierto, el pedido queda en pausa.",
+    "• TuPuestito no retiene el dinero: los reembolsos los emite el artista a través de Mercado Pago."
+  ].join("\n");
+}
+
 /** Convierte las etapas del servicio en montos en pesos; la última absorbe el redondeo */
 export function buildOrderMilestones(milestones: ServiceMilestone[], totalAmount: number): OrderMilestone[] {
   let assigned = 0;
@@ -46,7 +54,7 @@ export function buildOrderMilestones(milestones: ServiceMilestone[], totalAmount
 
 /** Estados en los que el pedido ya no admite acciones */
 export const TERMINAL_STATUSES: OrderStatus[] = ["REJECTED", "EXPIRED", "CANCELLED", "COMPLETED_HD_UNLOCKED"];
-/** Estados que ocupan un cupo (max_slots) del servicio */
+/** Estados que ocupan un cupo (max_slots) del servicio. Un pedido en reclamo no ocupa cupo. */
 export const SLOT_STATUSES: OrderStatus[] = [
   "ACCEPTED_WAITING_DEPOSIT",
   "IN_PROGRESS_SKETCH",
@@ -59,6 +67,57 @@ export const SLOT_STATUSES: OrderStatus[] = [
   "MILESTONE_IN_PROGRESS",
   "MILESTONE_REVIEW"
 ];
+/** Le toca trabajar al artista: corre su plazo de entrega */
+export const ARTIST_WORK_STATUSES: OrderStatus[] = ["IN_PROGRESS_SKETCH", "WORKING_FINAL", "MILESTONE_IN_PROGRESS"];
+/** El comprador tiene que revisar una entrega: corre el plazo de aprobación automática */
+export const BUYER_REVIEW_STATUSES: OrderStatus[] = ["SKETCH_REVIEW", "FINAL_PREVIEW_REVIEW", "MILESTONE_REVIEW"];
+/** El comprador tiene que pagar para que el pedido siga (ya hubo pagos antes) */
+export const BUYER_PAYMENT_STATUSES: OrderStatus[] = [
+  "WAITING_PAYMENT_AFTER_SKETCH",
+  "WAITING_PAYMENT_BEFORE_HD",
+  "MILESTONE_WAITING_PAYMENT"
+];
+/** Pedidos en curso con al menos un pago acreditado: admiten reclamo y cancelación con reembolso */
+export const PAID_ACTIVE_STATUSES: OrderStatus[] = [
+  ...ARTIST_WORK_STATUSES,
+  ...BUYER_REVIEW_STATUSES,
+  ...BUYER_PAYMENT_STATUSES
+];
+/** Estados en los que la próxima acción es del comprador / del artista (para "te toca a vos") */
+export const BUYER_ACTION_STATUSES: OrderStatus[] = [
+  "ACCEPTED_WAITING_DEPOSIT",
+  ...BUYER_REVIEW_STATUSES,
+  ...BUYER_PAYMENT_STATUSES
+];
+export const ARTIST_ACTION_STATUSES: OrderStatus[] = ["REQUESTED", ...ARTIST_WORK_STATUSES];
+
+const DAY_MS = 86_400_000;
+export const daysMs = (n: number) => n * DAY_MS;
+
+/** Fechas límite que rigen el estado actual del pedido (null cuando no aplican) */
+export function orderDeadlines(
+  order: Pick<Order, "status" | "statusChangedAt" | "acceptedAt" | "workDueAt" | "completedAt">
+) {
+  const since = order.statusChangedAt.getTime();
+  return {
+    depositExpiresAt:
+      order.status === "ACCEPTED_WAITING_DEPOSIT" && order.acceptedAt
+        ? new Date(order.acceptedAt.getTime() + config.DEPOSIT_EXPIRATION_HOURS * 3600_000)
+        : null,
+    requestExpiresAt: order.status === "REQUESTED" ? new Date(since + daysMs(config.REQUEST_EXPIRATION_DAYS)) : null,
+    reviewAutoApproveAt: BUYER_REVIEW_STATUSES.includes(order.status)
+      ? new Date(since + daysMs(config.REVIEW_AUTO_APPROVE_DAYS))
+      : null,
+    paymentTimeoutAt: BUYER_PAYMENT_STATUSES.includes(order.status)
+      ? new Date(since + daysMs(config.PAYMENT_TIMEOUT_DAYS))
+      : null,
+    workDueAt: ARTIST_WORK_STATUSES.includes(order.status) ? order.workDueAt : null,
+    disputeWindowEndsAt:
+      order.status === "COMPLETED_HD_UNLOCKED" && order.completedAt
+        ? new Date(order.completedAt.getTime() + daysMs(config.POST_DELIVERY_DISPUTE_DAYS))
+        : null
+  };
+}
 
 /** Cálculo de montos y fee (Plan Sprint 5: marketplace_fee 5%) */
 export function computeAmounts(plan: PaymentPlan, totalAmount: number, milestones: OrderMilestone[] = []) {
@@ -150,6 +209,10 @@ export async function addSystemMessage(tx: DbOrTx, orderId: string, content: str
 /**
  * Transición atómica: solo cambia si el estado actual sigue siendo `from`.
  * Evita carreras (doble clic, webhook duplicado, etc.).
+ *
+ * Además reinicia los plazos del nuevo estado y mantiene `workDueAt`: el plazo de entrega del
+ * artista solo corre mientras el pedido está en sus manos, así que se corre hacia adelante todo
+ * el tiempo que el pedido pasó esperando al comprador (o en reclamo).
  */
 export async function transition(
   tx: DbOrTx,
@@ -161,7 +224,15 @@ export async function transition(
   const fromList = Array.isArray(from) ? from : [from];
   const [updated] = await tx
     .update(commissionOrders)
-    .set({ ...extra, status: to })
+    .set({
+      workDueAt: sql`case when ${commissionOrders.status} in ('IN_PROGRESS_SKETCH', 'WORKING_FINAL', 'MILESTONE_IN_PROGRESS')
+        then ${commissionOrders.workDueAt}
+        else ${commissionOrders.workDueAt} + (now() - ${commissionOrders.statusChangedAt}) end`,
+      ...extra,
+      status: to,
+      statusChangedAt: sql`now()`,
+      reminderStage: 0
+    })
     .where(and(eq(commissionOrders.id, orderId), inArray(commissionOrders.status, fromList)))
     .returning();
   if (!updated) {
@@ -173,11 +244,18 @@ export async function transition(
 /** Participantes del pedido con email, para notificaciones */
 export async function orderParties(order: Pick<Order, "buyerId" | "artistId">) {
   const [buyer] = await db
-    .select({ id: users.id, email: users.email, name: users.name, username: users.username })
+    .select({ id: users.id, email: users.email, name: users.name, username: users.username, deletedAt: users.deletedAt })
     .from(users)
     .where(eq(users.id, order.buyerId));
   const [artist] = await db
-    .select({ id: users.id, email: users.email, name: users.name, username: users.username, profileId: artistProfiles.id })
+    .select({
+      id: users.id,
+      email: users.email,
+      name: users.name,
+      username: users.username,
+      deletedAt: users.deletedAt,
+      profileId: artistProfiles.id
+    })
     .from(artistProfiles)
     .innerJoin(users, eq(artistProfiles.userId, users.id))
     .where(eq(artistProfiles.id, order.artistId));
@@ -190,202 +268,130 @@ export async function notifyOrder(
   subject: string,
   message: string
 ) {
-  const parties = await orderParties(order);
-  const url = `${config.WEB_URL}/orders/${order.id}`;
-  const recipients = to === "both" ? [parties.buyer, parties.artist] : [parties[to]];
-  await Promise.all(
-    recipients.map((r) =>
-      sendEmail({
-        to: r.email,
-        subject: `${subject} · #${order.orderNumber}`,
-        title: subject,
-        html: `<p>Hola ${html.escape(r.name)},</p><p>${html.escape(message)}</p>`,
-        cta: { label: "Abrir sala del pedido", url }
-      })
-    )
-  );
-}
-
-// ─────────────────────────────────────────────────────────────
-// Cuenta de Mercado Pago del artista (con refresco de token)
-// ─────────────────────────────────────────────────────────────
-export async function getArtistMpToken(artistId: string): Promise<{ token: string; liveMode: boolean; accountId: string } | null> {
-  const [account] = await db
-    .select()
-    .from(paymentAccounts)
-    .where(
-      and(
-        eq(paymentAccounts.artistId, artistId),
-        eq(paymentAccounts.provider, "MERCADOPAGO"),
-        eq(paymentAccounts.isActive, true)
-      )
-    )
-    .limit(1);
-  if (!account) return null;
-
-  let token = decryptSecret(account.accessTokenEnc);
-  const expiresSoon = account.tokenExpiresAt && account.tokenExpiresAt.getTime() < Date.now() + 7 * 86400_000;
-  if (expiresSoon && account.refreshTokenEnc && config.PAYMENTS_MODE === "live") {
-    try {
-      const refreshed = await MercadoPagoService.refreshToken(decryptSecret(account.refreshTokenEnc));
-      token = refreshed.access_token;
-      await db
-        .update(paymentAccounts)
-        .set({
-          accessTokenEnc: encryptSecret(refreshed.access_token),
-          refreshTokenEnc: refreshed.refresh_token ? encryptSecret(refreshed.refresh_token) : account.refreshTokenEnc,
-          tokenExpiresAt: refreshed.expires_in ? new Date(Date.now() + refreshed.expires_in * 1000) : null
+  try {
+    const parties = await orderParties(order);
+    const url = `${config.WEB_URL}/orders/${order.id}`;
+    const recipients = (to === "both" ? [parties.buyer, parties.artist] : [parties[to]]).filter(
+      (r) => r && !r.deletedAt
+    );
+    await Promise.all(
+      recipients.map((r) =>
+        sendEmail({
+          to: r.email,
+          subject: `${subject} · #${order.orderNumber}`,
+          title: subject,
+          html: `<p>Hola ${html.escape(r.name)},</p><p>${html.escape(message).replace(/\n/g, "<br/>")}</p>`,
+          cta: { label: "Abrir sala del pedido", url }
         })
-        .where(eq(paymentAccounts.id, account.id));
-    } catch (err) {
-      console.error("[mp] No se pudo refrescar el token del artista", artistId, err);
-      if (account.tokenExpiresAt && account.tokenExpiresAt.getTime() < Date.now()) {
-        await db.update(paymentAccounts).set({ isActive: false }).where(eq(paymentAccounts.id, account.id));
-        return null;
-      }
-    }
+      )
+    );
+  } catch (err) {
+    console.error("[notify] No se pudo enviar el aviso del pedido", order.orderNumber, err);
   }
-  return { token, liveMode: account.liveMode, accountId: account.id };
 }
 
 // ─────────────────────────────────────────────────────────────
-// Procesamiento de pagos (webhook / retorno / simulador)
+// Aprobaciones del comprador. `auto` = el plazo de revisión venció y se aprueba sola.
 // ─────────────────────────────────────────────────────────────
-function nextAfterPayment(order: Order): { to: OrderStatus; message: string } | undefined {
-  if (order.paymentPlanSnapshot === "MILESTONES") {
-    const index = order.status === "MILESTONE_WAITING_PAYMENT" ? order.currentMilestone : 0;
-    const title = order.milestonesSnapshot[index]?.title ?? "";
-    const base = `Etapa ${index + 1} de ${order.milestonesSnapshot.length} ("${title}") paga: el artista ya puede empezarla.`;
-    if (order.status === "ACCEPTED_WAITING_DEPOSIT" || order.status === "MILESTONE_WAITING_PAYMENT") {
-      return { to: "MILESTONE_IN_PROGRESS", message: base };
-    }
-    if (order.status === "EXPIRED") {
-      return { to: "MILESTONE_IN_PROGRESS", message: `${base} (El pago llegó después del vencimiento y el pedido se reactivó.)` };
-    }
-    return undefined;
-  }
-  return NEXT_AFTER_PAYMENT[order.status];
-}
+export type ApprovalActor = "buyer" | "auto";
 
-const NEXT_AFTER_PAYMENT: Record<string, { to: OrderStatus; message: string }> = {
-  ACCEPTED_WAITING_DEPOSIT: {
-    to: "IN_PROGRESS_SKETCH",
-    message: "Pago inicial acreditado directamente en la cuenta del artista. ¡El artista comenzó el boceto!"
-  },
-  EXPIRED: {
-    to: "IN_PROGRESS_SKETCH",
-    message: "Pago inicial acreditado (llegó después del vencimiento, el pedido se reactivó). ¡El artista comenzó el boceto!"
-  },
-  WAITING_PAYMENT_AFTER_SKETCH: {
-    to: "WORKING_FINAL",
-    message: "Segundo pago (50%) acreditado al artista. El artista sigue con la obra final."
-  },
-  WAITING_PAYMENT_BEFORE_HD: {
-    to: "COMPLETED_HD_UNLOCKED",
-    message: "Pago final (50%) acreditado. ¡Se desbloqueó la descarga del archivo original HD sin marca de agua!"
-  }
-};
+const autoNote = () =>
+  `⏱️ Aprobación automática: pasaron ${config.REVIEW_AUTO_APPROVE_DAYS} días sin respuesta del comprador. `;
 
-export type PaymentOutcome = "applied" | "already_processed" | "ignored";
-
-/**
- * Aplica el resultado de un pago de Mercado Pago a su hito y al pedido.
- * Idempotente: se puede llamar varias veces con el mismo pago.
- */
-export async function applyMpPayment(payment: Pick<MpPayment, "id" | "status" | "external_reference" | "transaction_amount" | "currency_id">): Promise<PaymentOutcome> {
-  const milestoneId = payment.external_reference;
-  if (!milestoneId || !/^[0-9a-f-]{36}$/i.test(milestoneId)) return "ignored";
-
-  const result = await db.transaction(async (tx) => {
-    const [milestone] = await tx
-      .select()
-      .from(orderMilestonePayments)
-      .where(eq(orderMilestonePayments.id, milestoneId))
-      .for("update");
-    if (!milestone) return { outcome: "ignored" as const };
-
-    const [order] = await tx.select().from(commissionOrders).where(eq(commissionOrders.id, milestone.orderId)).for("update");
-    if (!order) return { outcome: "ignored" as const };
-
-    const mpPaymentId = String(payment.id);
-
-    if (payment.status === "refunded" || payment.status === "charged_back") {
-      await tx
-        .update(orderMilestonePayments)
-        .set({ status: payment.status === "refunded" ? "REFUNDED" : "CHARGED_BACK", mpPaymentId })
-        .where(eq(orderMilestonePayments.id, milestone.id));
-      await addSystemMessage(tx, order.id, `⚠️ El pago #${mpPaymentId} figura como ${payment.status === "refunded" ? "reembolsado" : "contracargo"} en Mercado Pago.`);
-      return { outcome: "applied" as const, order, notify: null };
-    }
-
-    if (payment.status !== "approved") {
-      if (payment.status === "rejected" || payment.status === "cancelled") {
-        await tx
-          .update(orderMilestonePayments)
-          .set({ status: "REJECTED", mpPaymentId })
-          .where(and(eq(orderMilestonePayments.id, milestone.id), eq(orderMilestonePayments.status, "PENDING")));
-      }
-      return { outcome: "ignored" as const };
-    }
-
-    if (milestone.status === "APPROVED") return { outcome: "already_processed" as const };
-
-    if (payment.currency_id !== "ARS" || Math.round(payment.transaction_amount) !== milestone.grossAmount) {
-      console.error("[mp] Monto/moneda no coinciden", { milestoneId, payment });
-      await addSystemMessage(tx, order.id, `⚠️ Se recibió el pago #${mpPaymentId} pero el monto no coincide con el pactado. Soporte lo revisará.`);
-      await notifyDiscord(`⚠️ Pago con monto inválido en #${order.orderNumber} (MP ${mpPaymentId})`);
-      return { outcome: "ignored" as const };
-    }
-
-    await tx
-      .update(orderMilestonePayments)
-      .set({ status: "APPROVED", mpPaymentId, paidAt: new Date() })
-      .where(eq(orderMilestonePayments.id, milestone.id));
-
-    const expected = pendingPayment({
-      ...order,
-      status: order.status === "EXPIRED" ? "ACCEPTED_WAITING_DEPOSIT" : order.status
-    });
-    const stageMatches = expected?.stage === milestone.stage && expected.milestoneIndex === milestone.milestoneIndex;
-    const next = nextAfterPayment(order);
-    if (!stageMatches || !next) {
-      await addSystemMessage(tx, order.id, `💳 Pago #${mpPaymentId} acreditado, pero el pedido está en estado ${order.status}. Soporte lo revisará.`);
-      await notifyDiscord(`⚠️ Pago acreditado fuera de flujo en #${order.orderNumber}: estado ${order.status}, hito ${milestone.stage}`);
-      return { outcome: "applied" as const, order, notify: null };
-    }
-
-    const updated = await transition(tx, order.id, order.status, next.to, {
-      ...(next.to === "COMPLETED_HD_UNLOCKED" ? { completedAt: new Date() } : {}),
-      // Un pedido por etapas reactivado tras vencer vuelve a la primera etapa
-      ...(order.paymentPlanSnapshot === "MILESTONES" && order.status !== "MILESTONE_WAITING_PAYMENT" ? { currentMilestone: 0 } : {})
-    });
-    await addSystemMessage(tx, order.id, `💳 Pago #${mpPaymentId} APROBADO ($${milestone.grossAmount.toLocaleString("es-AR")} ARS). ${next.message}`);
-    return { outcome: "applied" as const, order: updated, notify: next.message };
+export async function approveSketch(order: Order, actor: ApprovalActor = "buyer"): Promise<Order> {
+  const next = order.paymentPlanSnapshot === "SPLIT_ON_SKETCH" ? "WAITING_PAYMENT_AFTER_SKETCH" : "WORKING_FINAL";
+  const updated = await db.transaction(async (tx) => {
+    const o = await transition(tx, order.id, "SKETCH_REVIEW", next);
+    await addSystemMessage(
+      tx,
+      order.id,
+      (actor === "auto" ? autoNote() : "") +
+        (next === "WAITING_PAYMENT_AFTER_SKETCH"
+          ? "✅ Boceto aprobado. Próximo paso: abonar el 50% restante para que el artista pase a línea y color."
+          : "✅ Boceto aprobado. El artista continúa con la obra final.")
+    );
+    return o;
   });
-
-  if (result.outcome === "applied" && result.order && result.notify) {
-    void notifyOrder(result.order, "both", "Pago acreditado", result.notify);
-    void notifyDiscord(`💳 Pago aprobado en #${result.order.orderNumber} → ${result.order.status}`);
-  }
-  return result.outcome;
+  void notifyOrder(
+    updated,
+    actor === "auto" ? "both" : "artist",
+    actor === "auto" ? "Boceto aprobado automáticamente" : "¡Boceto aprobado!",
+    next === "WAITING_PAYMENT_AFTER_SKETCH"
+      ? "El boceto quedó aprobado. El comprador tiene que abonar el 50% restante para que el pedido siga."
+      : "El boceto quedó aprobado. El artista ya puede avanzar con la obra final."
+  );
+  return updated;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Vencimiento: ACCEPTED_WAITING_DEPOSIT → EXPIRED a las 72 hs (Plan §4)
-// ─────────────────────────────────────────────────────────────
-export async function expireUnpaidOrders(): Promise<number> {
-  const cutoff = new Date(Date.now() - config.DEPOSIT_EXPIRATION_HOURS * 3600_000);
-  const expired = await db
-    .update(commissionOrders)
-    .set({ status: "EXPIRED" })
-    .where(and(eq(commissionOrders.status, "ACCEPTED_WAITING_DEPOSIT"), lt(commissionOrders.acceptedAt, cutoff)))
-    .returning();
+export async function approveFinalPreview(order: Order, actor: ApprovalActor = "buyer"): Promise<Order> {
+  const updated = await db.transaction(async (tx) => {
+    const o = await transition(tx, order.id, "FINAL_PREVIEW_REVIEW", "WAITING_PAYMENT_BEFORE_HD");
+    await addSystemMessage(
+      tx,
+      order.id,
+      (actor === "auto" ? autoNote() : "") +
+        "✅ Vista previa final aprobada. Al acreditarse el 50% restante se desbloquea el original HD sin marca de agua."
+    );
+    return o;
+  });
+  void notifyOrder(
+    updated,
+    actor === "auto" ? "both" : "artist",
+    actor === "auto" ? "Vista previa aprobada automáticamente" : "Vista previa aprobada",
+    "La obra final quedó aprobada. El comprador tiene que abonar el saldo para descargar el original."
+  );
+  return updated;
+}
 
-  for (const order of expired) {
-    await addSystemMessage(db, order.id, `⌛ El pedido venció: no se registró el pago inicial dentro de las ${config.DEPOSIT_EXPIRATION_HOURS} hs.`);
-    void notifyOrder(order, "both", "Pedido vencido", "No se registró el pago inicial a tiempo y el pedido venció. El cupo quedó liberado.");
-  }
-  return expired.length;
+export async function approveMilestone(order: Order, actor: ApprovalActor = "buyer"): Promise<Order> {
+  const index = order.currentMilestone;
+  const total = order.milestonesSnapshot.length;
+  const isLast = index === total - 1;
+  const nextMilestone = order.milestonesSnapshot[index + 1];
+
+  const updated = await db.transaction(async (tx) => {
+    if (isLast) {
+      // Todas las etapas se pagan por adelantado: verificamos el 100% antes de liberar el original
+      const payments = await tx.select().from(orderMilestonePayments).where(eq(orderMilestonePayments.orderId, order.id));
+      const paid = payments.filter((p) => p.status === "APPROVED").reduce((acc, p) => acc + p.grossAmount, 0);
+      if (paid < order.totalAmount) throw new HttpError(409, "Todavía hay etapas sin pagar");
+      const o = await transition(tx, order.id, "MILESTONE_REVIEW", "COMPLETED_HD_UNLOCKED", { completedAt: new Date() });
+      await addSystemMessage(
+        tx,
+        order.id,
+        (actor === "auto" ? autoNote() : "") + "🎉 Etapa final aprobada. ¡Se desbloqueó la descarga del archivo original!"
+      );
+      return o;
+    }
+    const o = await transition(tx, order.id, "MILESTONE_REVIEW", "MILESTONE_WAITING_PAYMENT", { currentMilestone: index + 1 });
+    await addSystemMessage(
+      tx,
+      order.id,
+      (actor === "auto" ? autoNote() : "") +
+        `✅ Etapa ${index + 1}/${total} aprobada. Próximo paso: abonar la etapa ${index + 2} ("${nextMilestone!.title}", $${nextMilestone!.amount.toLocaleString("es-AR")} ARS) para que el artista la empiece.`
+    );
+    return o;
+  });
+  void notifyOrder(
+    updated,
+    actor === "auto" ? "both" : "artist",
+    isLast ? "¡Pedido completado!" : `Etapa ${index + 1} aprobada`,
+    isLast
+      ? "La etapa final quedó aprobada y el original ya se puede descargar."
+      : "La etapa quedó aprobada. El comprador tiene que abonar la siguiente para que el pedido siga."
+  );
+  return updated;
+}
+
+/** Cancela un pedido en curso y anula sus cobros pendientes */
+export async function cancelOrderTx(tx: DbOrTx, orderId: string, from: OrderStatus | OrderStatus[], message: string): Promise<Order> {
+  const order = await transition(tx, orderId, from, "CANCELLED");
+  await tx
+    .update(orderMilestonePayments)
+    .set({ status: "REJECTED" })
+    .where(and(eq(orderMilestonePayments.orderId, orderId), eq(orderMilestonePayments.status, "PENDING")));
+  await addSystemMessage(tx, orderId, message);
+  return order;
 }
 
 export async function nextOrderNumber(tx: DbOrTx): Promise<string> {

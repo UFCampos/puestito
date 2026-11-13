@@ -3,6 +3,8 @@ import { config } from "../config.js";
 import { safeEqual } from "./crypto.service.js";
 
 const MP_API = "https://api.mercadopago.com";
+/** Antigüedad máxima aceptada para una notificación firmada (cubre los reintentos de Mercado Pago) */
+const WEBHOOK_MAX_AGE_MS = 5 * 24 * 60 * 60 * 1000;
 
 export interface MpOAuthToken {
   access_token: string;
@@ -30,6 +32,15 @@ export interface MpPayment {
   date_approved?: string | null;
   collector_id?: number;
   marketplace_fee?: number;
+  /** Monto ya devuelto (reembolsos parciales dejan el pago en "approved") */
+  transaction_amount_refunded?: number;
+}
+
+export interface MpRefund {
+  id: number;
+  payment_id: number;
+  amount: number;
+  status: string;
 }
 
 export class MercadoPagoError extends Error {
@@ -153,6 +164,21 @@ export const MercadoPagoService = {
   },
 
   /**
+   * Reembolso total de un pago. Se hace con el access_token DEL ARTISTA: el dinero vuelve desde
+   * su cuenta y Mercado Pago devuelve también la comisión de la plataforma.
+   * La clave de idempotencia evita reembolsar dos veces si se reintenta.
+   */
+  async refundPayment(paymentId: string, sellerAccessToken: string, idempotencyKey: string): Promise<MpRefund> {
+    if (!/^\d+$/.test(paymentId)) throw new MercadoPagoError("payment_id inválido", 400);
+    return mpFetch<MpRefund>(`/v1/payments/${paymentId}/refunds`, {
+      method: "POST",
+      token: sellerAccessToken,
+      headers: { "X-Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({})
+    });
+  },
+
+  /**
    * Valida el header `x-signature` de las notificaciones Webhook.
    * manifest = `id:{data.id};request-id:{x-request-id};ts:{ts};`
    */
@@ -172,9 +198,11 @@ export const MercadoPagoService = {
     const v1 = parts.v1;
     if (!ts || !v1) return false;
 
-    // Rechazar notificaciones viejas (anti-replay, 10 min)
+    // La notificación es solo un aviso: el estado real siempre se consulta a la API de Mercado Pago
+    // y el procesamiento es idempotente, así que una repetición no hace daño. Por eso la ventana es
+    // amplia: Mercado Pago reintenta durante días y un reembolso o contracargo no se puede perder.
     const tsMs = ts.length > 10 ? Number(ts) : Number(ts) * 1000;
-    if (!Number.isFinite(tsMs) || Math.abs(Date.now() - tsMs) > 10 * 60 * 1000) return false;
+    if (!Number.isFinite(tsMs) || tsMs - Date.now() > 10 * 60 * 1000 || Date.now() - tsMs > WEBHOOK_MAX_AGE_MS) return false;
 
     let manifest = "";
     if (params.dataId) {

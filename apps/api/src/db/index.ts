@@ -11,6 +11,12 @@ export const pool = new pg.Pool({
   max: config.DATABASE_POOL_MAX
 });
 
+// Si Postgres se reinicia, las conexiones inactivas del pool emiten "error". Sin este listener eso
+// tumba el proceso; con él, el pool descarta la conexión y abre otra en el próximo pedido.
+pool.on("error", (err) => {
+  console.error("[pg] Se perdió una conexión inactiva del pool:", err.message);
+});
+
 export const db = drizzle(pool, { schema });
 export type Db = typeof db;
 /** Tipo común para `db` o una transacción */
