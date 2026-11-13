@@ -19,31 +19,43 @@ function layout(title: string, body: string, cta?: { label: string; url: string 
         : ""
     }
   </div>
-  <p style="text-align:center;font-size:11px;color:#94a3b8">Recibiste este correo por tu actividad en TuPuestito.</p>
+  <p style="text-align:center;font-size:11px;color:#94a3b8;line-height:1.6">
+    Recibiste este correo por tu actividad en TuPuestito.<br/>
+    ¿Necesitás ayuda? <a href="${config.WEB_URL}/ayuda" style="color:#7c3aed">Centro de ayuda</a> ·
+    <a href="mailto:${escapeHtml(config.SUPPORT_EMAIL)}" style="color:#7c3aed">${escapeHtml(config.SUPPORT_EMAIL)}</a>
+  </p>
 </body></html>`;
 }
 
+/** Envía un correo transaccional. Devuelve false si no se pudo entregar al proveedor. */
 export async function sendEmail(params: {
   to: string;
   subject: string;
   title: string;
   html: string;
   cta?: { label: string; url: string };
-}) {
+  replyTo?: string;
+}): Promise<boolean> {
   if (!resend) {
     console.info(`[email:dev] → ${params.to} | ${params.subject}${params.cta ? ` | ${params.cta.url}` : ""}`);
-    return;
+    return true;
   }
   try {
     const { error } = await resend.emails.send({
       from: config.EMAIL_FROM,
       to: params.to,
       subject: params.subject,
-      html: layout(params.title, params.html, params.cta)
+      html: layout(params.title, params.html, params.cta),
+      ...(params.replyTo ? { replyTo: params.replyTo } : {})
     });
-    if (error) console.error("[email] Resend error:", error);
+    if (error) {
+      console.error("[email] Resend error:", error);
+      return false;
+    }
+    return true;
   } catch (err) {
     console.error("[email] Error enviando correo:", err);
+    return false;
   }
 }
 
@@ -54,11 +66,37 @@ export async function notifyDiscord(content: string) {
     await fetch(config.DISCORD_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: content.slice(0, 1900), allowed_mentions: { parse: [] } })
+      body: JSON.stringify({ content: content.slice(0, 1900), allowed_mentions: { parse: [] } }),
+      signal: AbortSignal.timeout(5000)
     });
   } catch (err) {
     console.error("[discord] Error enviando webhook:", err);
   }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Alertas de errores al canal de operaciones
+// ─────────────────────────────────────────────────────────────
+const ALERT_WINDOW_MS = 10 * 60_000;
+const recentAlerts = new Map<string, { at: number; repeats: number }>();
+
+/**
+ * Avisa de un error al canal de operaciones. El mismo error (misma `key`) se informa una sola vez
+ * cada 10 minutos, con el contador de repeticiones, para que una falla en cadena no inunde el canal.
+ */
+export function alertOps(key: string, message: string) {
+  const now = Date.now();
+  const previous = recentAlerts.get(key);
+  if (previous && now - previous.at < ALERT_WINDOW_MS) {
+    previous.repeats += 1;
+    return;
+  }
+  const repeats = previous?.repeats ?? 0;
+  recentAlerts.set(key, { at: now, repeats: 0 });
+  if (recentAlerts.size > 500) {
+    for (const [k, v] of recentAlerts) if (now - v.at > ALERT_WINDOW_MS) recentAlerts.delete(k);
+  }
+  void notifyDiscord(`🚨 ${message}${repeats > 0 ? ` (se repitió ${repeats} veces más en los últimos minutos)` : ""}`);
 }
 
 export const html = { escape: escapeHtml };

@@ -2,62 +2,57 @@ name: CD
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: deploy-production
   cancel-in-progress: false
 
 jobs:
-  docker-check:
-    name: Docker Image Verification
+  images:
+    name: Verificar imágenes Docker
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build API Docker Image
-        uses: docker/build-push-action@v6
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
         with:
           context: .
           file: apps/api/Dockerfile
           push: false
-          tags: tupuestito-api:${{ github.sha }}
-
-      - name: Build Web Docker Image
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: .
           file: apps/web/Dockerfile
           push: false
           build-args: |
-            NEXT_PUBLIC_API_URL=https://api.tupuestito.com
-            NEXT_PUBLIC_SITE_URL=https://tupuestito.com
-          tags: tupuestito-web:${{ github.sha }}
+            NEXT_PUBLIC_API_URL=${{ vars.PUBLIC_API_URL || 'https://api.tupuestito.com.ar' }}
+            NEXT_PUBLIC_SITE_URL=${{ vars.PUBLIC_WEB_URL || 'https://tupuestito.com.ar' }}
 
   deploy:
-    name: Deploy
-    needs: docker-check
+    name: Deploy al VPS
+    needs: images
     runs-on: ubuntu-latest
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/tupuestito' }}
     steps:
-      - name: Target Environment
-        run: |
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            echo "Environment: PRODUCTION"
-          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
-            echo "Environment: STAGING"
-          fi
-
-      - name: Trigger Webhook Deploy (if configured)
-        if: env.DEPLOY_WEBHOOK_URL != ''
-        env:
-          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
-        run: |
-          curl -X POST -H "Content-Type: application/json" \
-            -d "{\"ref\":\"${{ github.ref }}\",\"sha\":\"${{ github.sha }}\"}" \
-            "${{ secrets.DEPLOY_WEBHOOK_URL }}"
+      - name: Sin credenciales de deploy
+        if: env.DEPLOY_HOST == '' || env.DEPLOY_USER == '' || env.DEPLOY_SSH_KEY == ''
+        run: echo "Configurá DEPLOY_HOST, DEPLOY_USER y DEPLOY_SSH_KEY para desplegar automáticamente."
+      - name: Desplegar por SSH
+        if: env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != ''
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ env.DEPLOY_HOST }}
+          username: ${{ env.DEPLOY_USER }}
+          key: ${{ env.DEPLOY_SSH_KEY }}
+          command_timeout: 30m
+          script: |
+            cd ${{ env.DEPLOY_PATH }}
+            git fetch --all --prune
+            git checkout --force ${{ github.sha }}
+            ./deploy/deploy.sh

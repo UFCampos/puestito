@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { apiFetch, API_URL, fileTooLarge, type AppConfig } from "@/lib/api";
+import type { OrderDeadlines } from "@/components/order/OrderResolution";
 
 export interface OrderMilestoneView {
   index: number;
@@ -71,6 +72,10 @@ interface Props {
   revisionsLeft: number;
   revisionsIncluded: number;
   limits: AppConfig["uploadLimitsMb"];
+  /** Fechas límite del estado actual (las muestra la sala arriba de estas acciones) */
+  deadlines?: OrderDeadlines | null;
+  /** Dónde mostrar los errores de las acciones (por defecto, junto al formulario de subida) */
+  onError?: (message: string) => void;
   busy: boolean;
   setBusy: (v: boolean) => void;
   reload: () => Promise<void>;
@@ -114,7 +119,7 @@ export function MilestoneActions(props: Props) {
       await action();
       await reload();
     } catch (err: any) {
-      alert(err.message);
+      (props.onError ?? setUploadError)(err.message);
     } finally {
       setBusy(false);
     }

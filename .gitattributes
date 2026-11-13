@@ -1,0 +1,11 @@
+# Fin de línea consistente en todos los sistemas
+* text=auto
+
+# Los scripts corren en Linux (VPS, Docker, CI): siempre LF
+*.sh text eol=lf
+deploy/Caddyfile text eol=lf
+
+# Binarios
+*.mp4 binary
+*.xlsx binary
+*.png binary

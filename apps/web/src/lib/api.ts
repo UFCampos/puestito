@@ -77,8 +77,41 @@ export const STATUS_LABEL: Record<string, string> = {
   CANCELLED: "Cancelado",
   MILESTONE_WAITING_PAYMENT: "Esperando pago de etapa",
   MILESTONE_IN_PROGRESS: "Etapa en proceso",
-  MILESTONE_REVIEW: "Etapa en revisión"
+  MILESTONE_REVIEW: "Etapa en revisión",
+  DISPUTED: "En reclamo"
 };
+
+/** Estados en los que el pedido ya terminó (bien o mal) */
+export const TERMINAL_STATUSES = ["REJECTED", "EXPIRED", "CANCELLED", "COMPLETED_HD_UNLOCKED"];
+
+/** Cómo terminó un reclamo */
+export const DISPUTE_RESOLUTION_LABEL: Record<string, string> = {
+  WITHDRAWN: "Retirado por quien lo abrió: el pedido continuó",
+  REFUNDED: "Cerrado con la cancelación del pedido",
+  RESUMED_BY_ADMIN: "El equipo de TuPuestito decidió que el pedido continúe",
+  CANCELLED_BY_ADMIN: "El equipo de TuPuestito canceló el pedido",
+  COMPLETED_BY_ADMIN: "El equipo de TuPuestito dio el pedido por completado",
+  CLOSED_BY_PROVIDER: "Resuelto por Mercado Pago"
+};
+
+/** Motivos de denuncia (mismos valores que la API) */
+export const REPORT_REASONS: { value: string; label: string }[] = [
+  { value: "ILLEGAL_CONTENT", label: "Contenido ilegal" },
+  { value: "MINOR_SAFETY", label: "Sexualización de menores" },
+  { value: "AI_GENERATED", label: "Arte generado con IA" },
+  { value: "STOLEN_ART", label: "Arte robado o plagio" },
+  { value: "SCAM_OR_FRAUD", label: "Estafa o fraude" },
+  { value: "HARASSMENT", label: "Acoso o maltrato" },
+  { value: "WRONG_RATING", label: "Clasificación +18 incorrecta" },
+  { value: "SPAM", label: "Spam" },
+  { value: "OTHER", label: "Otro motivo" }
+];
+
+export const money = (n: number | string | null | undefined) => `$${Number(n ?? 0).toLocaleString("es-AR")}`;
+export const formatDate = (d: string | Date | null | undefined) =>
+  d ? new Date(d).toLocaleDateString("es-AR", { day: "numeric", month: "long", year: "numeric" }) : "";
+export const formatDateTime = (d: string | Date | null | undefined) =>
+  d ? new Date(d).toLocaleString("es-AR", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "";
 
 export const PLAN_LABEL: Record<string, string> = {
   FULL_100: "100% al inicio",
@@ -124,13 +157,26 @@ export interface AppConfig {
   finalDeliveryFormats: string[];
   platformFeePercent: number;
   depositExpirationHours: number;
+  /** Plazos automáticos (en días) */
+  requestExpirationDays: number;
+  reviewAutoApproveDays: number;
+  paymentTimeoutDays: number;
+  postDeliveryDisputeDays: number;
+  supportEmail: string;
+  termsVersion: string;
 }
 
 export const DEFAULT_APP_CONFIG: AppConfig = {
   uploadLimitsMb: { reference: 5, avatar: 8, portfolio: 25, sketch: 30, finalPreview: 30, finalDelivery: 200 },
   finalDeliveryFormats: ["png", "jpg", "webp", "zip", "rar", "psd"],
   platformFeePercent: 5,
-  depositExpirationHours: 72
+  depositExpirationHours: 72,
+  requestExpirationDays: 7,
+  reviewAutoApproveDays: 7,
+  paymentTimeoutDays: 14,
+  postDeliveryDisputeDays: 7,
+  supportEmail: "soporte@tupuestito.com.ar",
+  termsVersion: "2026-11"
 };
 
 let configPromise: Promise<AppConfig> | null = null;

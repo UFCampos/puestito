@@ -1,10 +1,17 @@
-# Producción en el VPS (Plan Sprint 6):
-#   cp .env.production.example .env.production   # completar secretos
-#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+# Producción en el VPS:  ./deploy/deploy.sh   (ver docs/operaciones/runbook.md)
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    <<: *logging
+    security_opt: ["no-new-privileges:true"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -18,14 +25,39 @@ services:
       retries: 5
     # Sin puertos publicados: Postgres solo es accesible desde la red interna
 
+  backup:
+    build: ./deploy/backup
+    restart: unless-stopped
+    <<: *logging
+    environment:
+      PGHOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+    volumes:
+      - backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
     restart: unless-stopped
+    <<: *logging
+    security_opt: ["no-new-privileges:true"]
     env_file: .env.production
     environment:
       NODE_ENV: production
+      APP_VERSION: ${APP_VERSION:-dev}
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     depends_on:
       postgres:
@@ -38,16 +70,26 @@ services:
       args:
         NEXT_PUBLIC_API_URL: ${API_URL}
         NEXT_PUBLIC_SITE_URL: ${WEB_URL}
-        NEXT_PUBLIC_SOCIAL_PROVIDERS: ${NEXT_PUBLIC_SOCIAL_PROVIDERS}
+        NEXT_PUBLIC_SOCIAL_PROVIDERS: ${NEXT_PUBLIC_SOCIAL_PROVIDERS:-}
+        NEXT_PUBLIC_SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}
+        NEXT_PUBLIC_LEGAL_NAME: ${NEXT_PUBLIC_LEGAL_NAME:-}
+        NEXT_PUBLIC_LEGAL_CUIT: ${NEXT_PUBLIC_LEGAL_CUIT:-}
+        NEXT_PUBLIC_LEGAL_ADDRESS: ${NEXT_PUBLIC_LEGAL_ADDRESS:-}
+        NEXT_PUBLIC_DATA_FISCAL_URL: ${NEXT_PUBLIC_DATA_FISCAL_URL:-}
+        NEXT_PUBLIC_PLAUSIBLE_DOMAIN: ${NEXT_PUBLIC_PLAUSIBLE_DOMAIN:-}
     restart: unless-stopped
+    <<: *logging
+    security_opt: ["no-new-privileges:true"]
     environment:
       API_INTERNAL_URL: http://api:4000
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    <<: *logging
     ports:
       - "80:80"
       - "443:443"
@@ -66,5 +108,6 @@ services:
 
 volumes:
   pgdata:
+  backups:
   caddy_data:
   caddy_config:

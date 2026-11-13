@@ -3,7 +3,9 @@
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { apiFetch, resolveImageUrl } from "@/lib/api";
+import { apiFetch, formatDate, resolveImageUrl } from "@/lib/api";
+import { useMe } from "@/lib/useMe";
+import { ReportButton } from "@/components/ReportButton";
 import { useRouter } from "next/navigation";
 
 export default function ArtistProfilePage() {
@@ -18,9 +20,10 @@ export default function ArtistProfilePage() {
   const [copied, setCopied] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
   const router = useRouter();
+  const { user: viewer } = useMe();
 
   const enableAdultContent = async () => {
-    if (!confirm("Confirmo que soy mayor de 18 años y quiero ver contenido +18.")) return;
+    if (!confirm("Al continuar declarás que sos mayor de 18 años. Esta declaración queda registrada en tu cuenta. ¿Continuar?")) return;
     try {
       await apiFetch("/api/me/preferences", {
         method: "PUT",
@@ -64,6 +67,7 @@ export default function ArtistProfilePage() {
   }
 
   const { artist, portfolio = [], services = [], reviews = [] } = data;
+  const isOwner = viewer?.id === artist.userId;
 
   const allPortfolioTags: string[] = ["Todos"];
   portfolio.forEach((item: any) => {
@@ -145,6 +149,7 @@ export default function ArtistProfilePage() {
               >
                 {copied ? "✅ ¡Link copiado!" : "🔗 Compartir Puestito"}
               </button>
+              {!isOwner && <ReportButton targetType="ARTIST" targetId={artist.id} subject="este puestito" />}
             </div>
           </div>
 
@@ -170,6 +175,9 @@ export default function ArtistProfilePage() {
           )}
         </div>
 
+        {isOwner && artist.suspended && (
+          <p className="mx-6 mb-4 rounded-xl bg-rose-50 p-3 text-sm font-semibold text-rose-800">Tu puestito está suspendido y no es visible para el público.</p>
+        )}
         {/* Pestañas */}
         <div className="flex border-t border-slate-200 bg-slate-50/60 px-6">
           <button
@@ -209,6 +217,17 @@ export default function ArtistProfilePage() {
       </div>
 
       {/* Contenido de Pestaña 1: Comisiones */}
+      {activeTab === "services" && data.hiddenNsfwServices > 0 && (
+        <div className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-900">
+          <span>Este puestito tiene {data.hiddenNsfwServices} comisión(es) +18 que no se muestran.</span>
+          <button type="button" onClick={enableAdultContent} className="rounded-lg bg-white px-3 py-1.5 text-xs font-bold text-rose-800 shadow">
+            Soy mayor de 18: mostrarlas
+          </button>
+        </div>
+      )}
+      {activeTab === "services" && services.length === 0 && (
+        <p className="mt-6 rounded-2xl border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-500">Todavía no hay comisiones publicadas.</p>
+      )}
       {activeTab === "services" && (
         <section className="mt-6 grid gap-5 md:grid-cols-2">
           {services.map((srv: any) => {
@@ -226,6 +245,9 @@ export default function ArtistProfilePage() {
                     <span className="rounded-lg bg-purple-100 px-2.5 py-1 text-xs font-bold text-purple-800">
                       {srv.rating}
                     </span>
+                  </div>
+                  <div className="mt-1 text-right">
+                    {!isOwner && <ReportButton targetType="SERVICE" targetId={srv.id} subject="esta comisión" />}
                   </div>
 
                   <p className="mt-2 text-sm leading-relaxed text-slate-600">{srv.description}</p>
@@ -344,7 +366,7 @@ export default function ArtistProfilePage() {
                 onChange={(e) => setRevealNsfw(e.target.checked)}
                 className="h-4 w-4 rounded text-purple-600"
               />
-              <span>Desbloquear obras Suggestive / NSFW (+18)</span>
+              <span>Mostrar obras sugerentes sin desenfocar</span>
             </label>
           </div>
 
@@ -381,7 +403,13 @@ export default function ArtistProfilePage() {
                     )}
                   </div>
                   <div className="p-4">
-                    <h3 className="font-bold text-slate-900">{item.title}</h3>
+                    <div className="flex items-start justify-between gap-2">
+                      <h3 className="font-bold text-slate-900">{item.title}</h3>
+                      {isOwner && item.moderationHidden && (
+                        <span className="shrink-0 rounded-full bg-rose-100 px-2 py-0.5 text-[11px] font-bold text-rose-800">Oculta por moderación</span>
+                      )}
+                      {!isOwner && <ReportButton targetType="PORTFOLIO_ITEM" targetId={item.id} label="" subject="esta obra" />}
+                    </div>
                     {item.description && (
                       <p className="mt-1 text-xs text-slate-500">{item.description}</p>
                     )}
@@ -427,6 +455,10 @@ export default function ArtistProfilePage() {
                       </span>
                     </div>
                     <p className="mt-1.5 text-sm text-slate-700">{rev.comment}</p>
+                    <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
+                      <span>{formatDate(rev.createdAt)}</span>
+                      {viewer && <ReportButton targetType="REVIEW" targetId={rev.id} subject="esta reseña" />}
+                    </div>
                   </div>
                 ))}
               </div>

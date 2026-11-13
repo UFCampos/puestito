@@ -39,6 +39,9 @@ jobs:
       - name: Run Type Check
         run: pnpm typecheck
 
+      - name: Unit tests
+        run: pnpm test:unit
+
   test-e2e:
     name: E2E API Tests
     runs-on: ubuntu-latest

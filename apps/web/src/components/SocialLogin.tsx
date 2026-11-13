@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { authClient } from "@/lib/api";
 
 const PROVIDERS = (process.env.NEXT_PUBLIC_SOCIAL_PROVIDERS || "")
@@ -34,6 +35,10 @@ export function SocialLogin({ next = "/" }: { next?: string }) {
           {LABEL[provider]}
         </button>
       ))}
+      <p className="text-center text-[11px] text-slate-500">
+        Al continuar con Google o Discord declarás ser mayor de 18 años y aceptás los{" "}
+        <Link href="/terms" target="_blank" className="underline">Términos</Link> y la <Link href="/privacy" target="_blank" className="underline">Política de Privacidad</Link>.
+      </p>
       <div className="flex items-center gap-3 pt-2 text-xs text-slate-400">
         <span className="h-px flex-1 bg-slate-200" /> o con tu email <span className="h-px flex-1 bg-slate-200" />
       </div>

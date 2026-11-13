@@ -5,11 +5,34 @@ import { username } from "better-auth/plugins";
 import { eq } from "drizzle-orm";
 import { db } from "./db/index.js";
 import { users, sessions, accounts, verifications } from "./db/schema.js";
-import { config, isProd } from "./config.js";
+import { TERMS_VERSION, config, isProd, relaxLimits } from "./config.js";
 import { sendEmail, html } from "./services/notification.service.js";
 
 const USERNAME_RE = /^[a-z0-9_]{3,30}$/;
-const RESERVED = new Set(["admin", "api", "dashboard", "login", "register", "orders", "my-orders", "terms", "privacy", "u", "tupuestito", "soporte", "support"]);
+const RESERVED = new Set([
+  "admin",
+  "api",
+  "dashboard",
+  "login",
+  "register",
+  "orders",
+  "my-orders",
+  "terms",
+  "privacy",
+  "u",
+  "tupuestito",
+  "soporte",
+  "support",
+  "ayuda",
+  "cuenta",
+  "arrepentimiento",
+  "moderacion",
+  "eliminado",
+  "sistema",
+  // Chocarían con GET /api/artists/explore y /api/artists/sitemap
+  "explore",
+  "sitemap"
+]);
 
 /** Genera un @username libre para altas vía Google/Discord */
 async function uniqueUsernameFrom(seed: string): Promise<string> {
@@ -63,7 +86,12 @@ export const auth = betterAuth({
   user: {
     additionalFields: {
       role: { type: "string", required: false, defaultValue: "BUYER", input: false },
-      showNsfw: { type: "boolean", required: false, defaultValue: false, input: false }
+      showNsfw: { type: "boolean", required: false, defaultValue: false, input: false },
+      // Moderación y consentimiento: nunca los puede fijar el cliente (input: false)
+      suspendedAt: { type: "date", required: false, input: false },
+      deletedAt: { type: "date", required: false, input: false },
+      termsAcceptedAt: { type: "date", required: false, input: false },
+      termsVersion: { type: "string", required: false, input: false }
     }
   },
   emailAndPassword: {
@@ -108,17 +136,20 @@ export const auth = betterAuth({
         async before(user) {
           // Altas por Google / Discord no traen @username: generamos uno libre.
           const u = user as typeof user & { username?: string | null; displayUsername?: string | null };
+          // Crear la cuenta implica aceptar los Términos y la Política de Privacidad vigentes
+          // (casilla obligatoria en el registro, aviso junto a los botones de Google/Discord).
+          const consent = { termsAcceptedAt: new Date(), termsVersion: TERMS_VERSION };
           if (!u.username) {
             const generated = await uniqueUsernameFrom(u.name || u.email.split("@")[0]);
-            return { data: { ...user, username: generated, displayUsername: generated } };
+            return { data: { ...user, ...consent, username: generated, displayUsername: generated } };
           }
-          return { data: user };
+          return { data: { ...user, ...consent } };
         }
       }
     }
   },
   rateLimit: {
-    enabled: true,
+    enabled: !relaxLimits,
     window: 60,
     max: 100,
     customRules: {

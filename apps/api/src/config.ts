@@ -30,6 +30,8 @@ const EnvSchema = z.object({
   DISCORD_CLIENT_ID: z.string().optional(),
   DISCORD_CLIENT_SECRET: z.string().optional(),
   REQUIRE_EMAIL_VERIFICATION: bool,
+  /** Solo desarrollo y tests: desactiva los límites de pedidos por minuto (en producción se ignora) */
+  RELAX_RATE_LIMITS: bool,
 
   // ── Cifrado de tokens OAuth de Mercado Pago (AES-256-GCM) ──
   /** 32 bytes en base64 o hex (openssl rand -base64 32) */
@@ -62,6 +64,28 @@ const EnvSchema = z.object({
 
   // ── Reglas de negocio ──
   DEPOSIT_EXPIRATION_HOURS: z.coerce.number().default(72),
+  /** Una solicitud que el artista no responde vence sola pasado este plazo */
+  REQUEST_EXPIRATION_DAYS: z.coerce.number().positive().default(7),
+  /** Si el comprador no revisa una entrega (boceto, vista previa o etapa) se aprueba automáticamente */
+  REVIEW_AUTO_APPROVE_DAYS: z.coerce.number().positive().default(7),
+  /** Pasado este plazo sin el pago de la etapa siguiente, el artista puede cerrar el pedido */
+  PAYMENT_TIMEOUT_DAYS: z.coerce.number().positive().default(14),
+  /** Días de atraso del artista a partir de los cuales se avisa a moderación */
+  OVERDUE_ESCALATION_DAYS: z.coerce.number().positive().default(7),
+  /** Ventana para reclamar después de recibir la entrega final */
+  POST_DELIVERY_DISPUTE_DAYS: z.coerce.number().min(0).default(7),
+  /** Días que se conservan los archivos de pedidos rechazados, vencidos o cancelados */
+  ORDER_FILES_RETENTION_DAYS: z.coerce.number().positive().default(30),
+  /** Cada cuántos minutos corren los plazos automáticos (0 = desactivado; se pueden correr a mano desde /admin) */
+  JOBS_INTERVAL_MINUTES: z.coerce.number().min(0).default(10),
+
+  // ── Soporte y moderación ──
+  /** Casilla que recibe consultas, reclamos y pedidos de arrepentimiento */
+  SUPPORT_EMAIL: z.string().email().default("soporte@tupuestito.com.ar"),
+  /** Emails (separados por coma) que pasan a ser ADMIN una vez verificados */
+  ADMIN_EMAILS: z.string().default(""),
+  /** Versión del build, para /health (la define el script de deploy) */
+  APP_VERSION: z.string().default("dev"),
 
   // ── Límites de subida (MB por archivo) ──
   MAX_AVATAR_MB: z.coerce.number().int().min(1).max(50).default(8),
@@ -79,6 +103,8 @@ if (!parsed.success) {
 
 const env = parsed.data;
 export const isProd = env.NODE_ENV === "production";
+/** Los tests e2e hacen en segundos lo que una persona hace en días: necesitan saltear los límites */
+export const relaxLimits = !isProd && env.RELAX_RATE_LIMITS;
 
 const DEV_AUTH_SECRET = "dev_only_better_auth_secret_change_me_0123456789";
 const DEV_ENCRYPTION_KEY = "ZGV2X29ubHlfZW5jcnlwdGlvbl9rZXlfMzJfYnl0ZXM="; // base64 de 32 bytes, solo dev
@@ -117,9 +143,15 @@ if (env.STORAGE_DRIVER === "r2") {
   }
 }
 
+/** Versión vigente de los Términos y la Política de Privacidad (se guarda junto a cada aceptación) */
+export const TERMS_VERSION = "2026-11";
+
 export const config = {
   ...env,
   BETTER_AUTH_SECRET: env.BETTER_AUTH_SECRET ?? DEV_AUTH_SECRET,
   ENCRYPTION_KEY: env.ENCRYPTION_KEY ?? DEV_ENCRYPTION_KEY,
-  PLATFORM_FEE_RATE: env.PLATFORM_FEE_PERCENT / 100
+  PLATFORM_FEE_RATE: env.PLATFORM_FEE_PERCENT / 100,
+  ADMIN_EMAIL_LIST: env.ADMIN_EMAILS.split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean)
 };

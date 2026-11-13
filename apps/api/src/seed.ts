@@ -195,8 +195,12 @@ async function main() {
 
   await createUser("comprador@tupuestito.com", "uriel_fan", "Uriel Comprador 🎨", img("1527980965255-d3b416303d12", 300));
 
+  // Cuenta de moderación para probar el panel /admin en desarrollo
+  const moderadora = await createUser("moderacion@tupuestito.com", "moderadora", "Moderación TuPuestito 🛡️", img("1438761681033-6461ffad8d80", 300));
+  await db.update(users).set({ role: "ADMIN" }).where(eq(users.id, moderadora.id));
+
   console.log(`✅ Seed listo en ${config.DATABASE_URL.replace(/\/\/[^@]+@/, "//***@")}`);
-  console.log(`   Cuentas demo (contraseña "${DEMO_PASSWORD}"): maomao, kaito_ink, uriel_fan`);
+  console.log(`   Cuentas demo (contraseña "${DEMO_PASSWORD}"): maomao, kaito_ink (artistas), uriel_fan (comprador), moderadora (admin)`);
 }
 
 main()

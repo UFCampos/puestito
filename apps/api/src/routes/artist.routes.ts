@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../db/index.js";
 import {
@@ -10,7 +10,7 @@ import {
   reviews,
   users
 } from "../db/schema.js";
-import { HttpError, getSessionUser, parseBody, requireArtist, requireUser } from "../lib/http.js";
+import { HttpError, getSessionUser, parseBody, requireArtist } from "../lib/http.js";
 import { loadTags, setPortfolioTags, setServiceTags } from "../lib/tags.js";
 import { WatermarkService } from "../services/watermark.service.js";
 import { newKey, storage } from "../services/storage.service.js";
@@ -132,7 +132,8 @@ export async function artistRoutes(fastify: FastifyInstance) {
       query.rating === "SFW_ONLY" ? ["SFW"] : showNsfw ? ["SFW", "SUGGESTIVE", "NSFW"] : ["SFW", "SUGGESTIVE"]
     );
 
-    const conditions = [];
+    // Las cuentas suspendidas o eliminadas no aparecen en la vidriera
+    const conditions = [isNull(users.suspendedAt), isNull(users.deletedAt)];
     if (query.status && ["OPEN", "WAITLIST", "CLOSED"].includes(query.status)) {
       conditions.push(eq(artistProfiles.commissionStatus, query.status as "OPEN" | "WAITLIST" | "CLOSED"));
     }
@@ -151,7 +152,7 @@ export async function artistRoutes(fastify: FastifyInstance) {
       })
       .from(artistProfiles)
       .innerJoin(users, eq(artistProfiles.userId, users.id))
-      .where(conditions.length ? and(...conditions) : undefined)
+      .where(and(...conditions))
       .orderBy(desc(artistProfiles.isVerifiedHuman), desc(artistProfiles.createdAt))
       .limit(200);
 
@@ -162,11 +163,17 @@ export async function artistRoutes(fastify: FastifyInstance) {
       db
         .select()
         .from(commissionServices)
-        .where(and(inArray(commissionServices.artistId, artistIds), eq(commissionServices.isActive, true))),
+        .where(
+          and(
+            inArray(commissionServices.artistId, artistIds),
+            eq(commissionServices.isActive, true),
+            isNull(commissionServices.moderatedAt)
+          )
+        ),
       db
         .select()
         .from(portfolioItems)
-        .where(inArray(portfolioItems.artistId, artistIds))
+        .where(and(inArray(portfolioItems.artistId, artistIds), isNull(portfolioItems.hiddenAt)))
         .orderBy(desc(portfolioItems.createdAt)),
       db
         .select({
@@ -175,7 +182,7 @@ export async function artistRoutes(fastify: FastifyInstance) {
           n: sql<number>`count(*)::int`
         })
         .from(reviews)
-        .where(inArray(reviews.artistId, artistIds))
+        .where(and(inArray(reviews.artistId, artistIds), isNull(reviews.hiddenAt)))
         .groupBy(reviews.artistId)
     ]);
 
@@ -249,14 +256,28 @@ export async function artistRoutes(fastify: FastifyInstance) {
     if (!row) throw new HttpError(404, "Artista no encontrado");
     const { user, profile } = row;
     const isOwner = viewer?.id === user.id;
+    const isStaff = viewer?.role === "ADMIN";
+    // Un puestito suspendido o eliminado solo lo ven su dueño y moderación
+    if ((user.suspendedAt || user.deletedAt) && !isOwner && !isStaff) throw new HttpError(404, "Artista no encontrado");
     const showNsfw = Boolean(viewer?.showNsfw) || isOwner;
+    const seesHidden = isOwner || isStaff;
 
-    const [portfolio, services, artistReviews] = await Promise.all([
-      db.select().from(portfolioItems).where(eq(portfolioItems.artistId, profile.id)).orderBy(desc(portfolioItems.createdAt)),
+    const [portfolio, allServices, artistReviews] = await Promise.all([
+      db
+        .select()
+        .from(portfolioItems)
+        .where(and(eq(portfolioItems.artistId, profile.id), seesHidden ? undefined : isNull(portfolioItems.hiddenAt)))
+        .orderBy(desc(portfolioItems.createdAt)),
       db
         .select()
         .from(commissionServices)
-        .where(and(eq(commissionServices.artistId, profile.id), eq(commissionServices.isActive, true)))
+        .where(
+          and(
+            eq(commissionServices.artistId, profile.id),
+            eq(commissionServices.isActive, true),
+            isNull(commissionServices.moderatedAt)
+          )
+        )
         .orderBy(desc(commissionServices.createdAt)),
       db
         .select({
@@ -270,10 +291,12 @@ export async function artistRoutes(fastify: FastifyInstance) {
         })
         .from(reviews)
         .innerJoin(users, eq(reviews.buyerId, users.id))
-        .where(eq(reviews.artistId, profile.id))
+        .where(and(eq(reviews.artistId, profile.id), isNull(reviews.hiddenAt)))
         .orderBy(desc(reviews.createdAt))
         .limit(50)
     ]);
+    // Plan §2: las comisiones +18 solo se muestran a quien declaró ser mayor de edad
+    const services = showNsfw ? allServices : allServices.filter((s) => s.rating !== "NSFW");
 
     const portfolioTags = await loadTags(db, "portfolio", portfolio.map((p) => p.id));
     const extras = await servicesWithExtras(services.map((s) => s.id));
@@ -292,10 +315,17 @@ export async function artistRoutes(fastify: FastifyInstance) {
         isVerifiedHuman: profile.isVerifiedHuman,
         socialLinks: profile.socialLinks ?? {},
         defaultWatermarkMode: profile.defaultWatermarkMode,
-        watermarkCustomText: profile.watermarkCustomText
+        watermarkCustomText: profile.watermarkCustomText,
+        suspended: Boolean(user.suspendedAt)
       },
       viewerCanSeeNsfw: showNsfw,
-      portfolio: portfolio.map((p) => ({ ...visibleImage(p, showNsfw), tags: portfolioTags.get(p.id) ?? [] })),
+      /** Comisiones +18 que este visitante no ve por no tener activado el contenido adulto */
+      hiddenNsfwServices: allServices.length - services.length,
+      portfolio: portfolio.map((p) => ({
+        ...visibleImage(p, showNsfw),
+        tags: portfolioTags.get(p.id) ?? [],
+        moderationHidden: Boolean(p.hiddenAt)
+      })),
       services: services.map((s) => {
         const active = extras.activeCounts.get(s.id) ?? 0;
         return {
@@ -547,12 +577,19 @@ export async function artistRoutes(fastify: FastifyInstance) {
     const { profile } = await requireArtist(request);
     const { serviceId } = request.params as { serviceId: string };
     const { isActive } = parseBody(z.object({ isActive: z.boolean() }), request.body);
-    const [updated] = await db
-      .update(commissionServices)
-      .set({ isActive })
+    const [service] = await db
+      .select({ moderatedAt: commissionServices.moderatedAt, moderationReason: commissionServices.moderationReason })
+      .from(commissionServices)
       .where(and(eq(commissionServices.id, serviceId), eq(commissionServices.artistId, profile.id)))
-      .returning({ id: commissionServices.id });
-    if (!updated) throw new HttpError(404, "Servicio no encontrado");
+      .limit(1);
+    if (!service) throw new HttpError(404, "Servicio no encontrado");
+    if (isActive && service.moderatedAt) {
+      throw new HttpError(
+        409,
+        `Esta comisión fue despublicada por moderación${service.moderationReason ? ` (${service.moderationReason})` : ""}. Escribinos a ${config.SUPPORT_EMAIL} para revisarlo.`
+      );
+    }
+    await db.update(commissionServices).set({ isActive }).where(eq(commissionServices.id, serviceId));
     return { ok: true, isActive };
   });
 
@@ -580,20 +617,17 @@ export async function artistRoutes(fastify: FastifyInstance) {
   });
 
   // ───────────────────────────────────────────────────────────
-  // POST /api/artists/:artistId/verify-human — insignia anti-IA (solo ADMIN)
+  // GET /api/artists/sitemap — puestitos públicos, para el sitemap.xml del sitio
   // ───────────────────────────────────────────────────────────
-  fastify.post("/:artistId/verify-human", async (request) => {
-    const user = await requireUser(request);
-    if (user.role !== "ADMIN") throw new HttpError(403, "Solo administradores");
-    const { artistId } = request.params as { artistId: string };
-    const { verified } = parseBody(z.object({ verified: z.boolean() }), request.body);
-    const [updated] = await db
-      .update(artistProfiles)
-      .set({ isVerifiedHuman: verified })
-      .where(eq(artistProfiles.id, artistId))
-      .returning({ id: artistProfiles.id });
-    if (!updated) throw new HttpError(404, "Artista no encontrado");
-    return { ok: true };
+  fastify.get("/sitemap", async () => {
+    const rows = await db
+      .select({ username: users.username, updatedAt: artistProfiles.updatedAt })
+      .from(artistProfiles)
+      .innerJoin(users, eq(artistProfiles.userId, users.id))
+      .where(and(isNull(users.suspendedAt), isNull(users.deletedAt)))
+      .orderBy(desc(artistProfiles.updatedAt))
+      .limit(5000);
+    return { artists: rows.filter((r) => r.username) };
   });
 }
 

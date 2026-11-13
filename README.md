@@ -11,14 +11,14 @@ La especificación de referencia es [`docs/business-planning/plan_tecnico_mvp.md
 ### 👤 Lado del Cliente (Comprador)
 Explorar artistas, registrarse, solicitar una comisión 50/50 con extras y referencias, pagar la seña, pedir ajustes sobre el boceto, aprobar la entrega, abonar el saldo restante, descargar el original en HD y dejar una reseña.
 
-<video src="https://raw.githubusercontent.com/UFCampos/puestito/feat/service-editor-and-delivery-packages/docs/demo/demo-cliente.mp4" controls width="100%"></video>
+<video src="https://raw.githubusercontent.com/UFCampos/puestito/main/docs/demo/demo-cliente.mp4" controls width="100%"></video>
 
 > 💡 *Si tu visor de Markdown no reproduce el video en línea, podés [abrir `docs/demo/demo-cliente.mp4` directamente](./docs/demo/demo-cliente.mp4).*
 
 ### 🎨 Lado del Artista
 Crear una nueva comisión por etapas (milestones) con el asistente tipo Fiverr, editar el precio de un servicio publicado, aceptar un pedido entrante, entregar cada etapa (incluyendo entrega final en `.zip` con vista previa protegida por marca de agua) y recibir la reseña en su vidriera pública.
 
-<video src="https://raw.githubusercontent.com/UFCampos/puestito/feat/service-editor-and-delivery-packages/docs/demo/demo-artista.mp4" controls width="100%"></video>
+<video src="https://raw.githubusercontent.com/UFCampos/puestito/main/docs/demo/demo-artista.mp4" controls width="100%"></video>
 
 > 💡 *Si tu visor de Markdown no reproduce el video en línea, podés [abrir `docs/demo/demo-artista.mp4` directamente](./docs/demo/demo-artista.mp4).*
 
@@ -41,6 +41,8 @@ Crear una nueva comisión por etapas (milestones) con el asistente tipo Fiverr, 
 
 `REQUESTED → (REJECTED) | ACCEPTED_WAITING_DEPOSIT → (EXPIRED a las 72 hs) | IN_PROGRESS_SKETCH ⇄ SKETCH_REVIEW → [WAITING_PAYMENT_AFTER_SKETCH] → WORKING_FINAL → [FINAL_PREVIEW_REVIEW → WAITING_PAYMENT_BEFORE_HD] → COMPLETED_HD_UNLOCKED`
 
+Con un pago acreditado, cualquier estado en curso puede pasar a `DISPUTED` (reclamo abierto: el pedido queda en pausa y vuelve a su estado cuando se resuelve).
+
 ### Formas de cobro que elige el artista por comisión
 
 | Plan | Cómo se cobra |
@@ -53,6 +55,30 @@ Crear una nueva comisión por etapas (milestones) con el asistente tipo Fiverr, 
 - El original HD vive en el bucket privado y **solo se entrega con una URL firmada de 5 minutos cuando el 100% figura `APPROVED`**.
 - Los pagos se confirman por webhook (firma `x-signature` verificada) o al volver del checkout, consultando siempre la API de Mercado Pago. El procesamiento es idempotente.
 - Los conceptos de cobro son neutros (`Encargo de ilustración digital #PST-1042 — @artista`), según el Plan §2.
+
+### Cuando un pedido se complica
+
+Ningún pedido queda trabado esperando a una de las partes. Los plazos se configuran por variable de entorno:
+
+| Situación | Qué pasa | Variable (por defecto) |
+|---|---|---|
+| El artista no responde una solicitud | Recordatorio y luego vence, sin cobro | `REQUEST_EXPIRATION_DAYS` (7) |
+| No se paga el pago inicial | Recordatorio y luego vence, libera el cupo | `DEPOSIT_EXPIRATION_HOURS` (72) |
+| El comprador no revisa una entrega | Recordatorio y luego se aprueba sola | `REVIEW_AUTO_APPROVE_DAYS` (7) |
+| No se paga un pago intermedio | Recordatorios; el artista puede cerrar el pedido | `PAYMENT_TIMEOUT_DAYS` (14) |
+| El artista se atrasa | Aviso a las dos partes; luego, a moderación | `OVERDUE_ESCALATION_DAYS` (7) |
+| Reclamo después de la entrega final | Ventana del comprador | `POST_DELIVERY_DISPUTE_DAYS` (7) |
+
+- **Reclamos:** con un pago acreditado, cualquiera de las partes abre un reclamo desde la sala del pedido. El pedido se pausa y se resuelve por acuerdo, por reembolso o por el equipo.
+- **Reembolsos:** los emite el artista desde la sala (con su cuenta de Mercado Pago). Total: inmediato. Parcial o sin reembolso: propuesta que el comprador acepta.
+- **Mercado Pago después del pago:** reembolsos, contracargos y reclamos que informa Mercado Pago ahora mueven el pedido y avisan al equipo.
+
+### Moderación, soporte y datos personales
+
+- `/admin` (rol ADMIN, se asigna con `ADMIN_EMAILS`): resumen y checklist de lanzamiento, reclamos, denuncias, pedidos, usuarios (suspensión, insignia "100% Humano"), soporte y auditoría. Guía: [moderación](./docs/operaciones/moderacion.md).
+- Botón **Denunciar** en puestitos, obras, comisiones, reseñas y pedidos.
+- `/ayuda` (preguntas frecuentes + contacto) y `/arrepentimiento` (Res. 424/2020, sin necesidad de cuenta).
+- `/cuenta`: descargar todos los datos y eliminar la cuenta (Ley 25.326). Con historial de pedidos, la cuenta se anonimiza.
 
 ---
 
@@ -73,15 +99,16 @@ pnpm dev                                    # API :4000 + Web :3000
 - `PAYMENTS_MODE=mock` usa un simulador de checkout (requiere sesión del comprador). **La API se niega a arrancar con `mock` en producción.**
 - Sin `RESEND_API_KEY`, los emails (verificación, recuperación de contraseña, avisos) se imprimen en la consola de la API.
 
-Cuentas demo (contraseña `tupuestito123`): `maomao` y `kaito_ink` (artistas), `uriel_fan` (comprador).
+Cuentas demo (contraseña `tupuestito123`): `maomao` y `kaito_ink` (artistas), `uriel_fan` (comprador), `moderadora` (admin, para `/admin`).
 
-### Tests end-to-end de la API
+### Tests
 
 ```bash
-pnpm test:e2e
+pnpm test:unit   # lógica de montos, plazos, firmas y cifrado (sin base de datos)
+pnpm test:e2e    # e2e/flow.mjs + e2e/launch.mjs contra una API real
 ```
 
-Levanta un PostgreSQL embebido (PGlite), corre las migraciones y el seed, y recorre el flujo completo: auth, explorar, referencias firmadas, pedido 50/50, marca de agua, bloqueo del HD, pagos, reseñas y controles de permisos.
+Levanta un PostgreSQL embebido (PGlite), corre las migraciones y el seed, y recorre el flujo completo: auth, explorar, referencias firmadas, pedido 50/50, marca de agua, bloqueo del HD, pagos, reseñas y controles de permisos. `launch.mjs` cubre reclamos, reembolsos, contracargos, plazos automáticos (simulando el paso de los días), moderación, suspensiones, soporte y eliminación de cuentas.
 
 Corre en un entorno aislado (API en `:4100`, Postgres embebido en `:55432`), así que se puede ejecutar con `pnpm dev` abierto sin tocar tu base de desarrollo.
 
@@ -122,14 +149,16 @@ La API aplica las migraciones pendientes al iniciar.
 6. En el VPS:
    ```bash
    cp .env.production.example .env.production   # completar todos los secretos
-   pnpm prod:up                                 # docker compose -f docker-compose.prod.yml ... up -d --build
+   ./deploy/deploy.sh                           # backup previo, build, espera a /health
    ```
+
+Antes de abrir al público: [checklist de lanzamiento](./docs/operaciones/lanzamiento.md). Deploy, backups, alertas y secretos: [runbook](./docs/operaciones/runbook.md). Prueba con dinero de prueba: [Mercado Pago sandbox](./docs/operaciones/mercadopago-sandbox.md).
 
 > ⚠️ Guardá `ENCRYPTION_KEY` en un lugar seguro: sin ella no se pueden descifrar los tokens de Mercado Pago y los artistas tienen que volver a vincular su cuenta.
 
 ### Administración
 
-- La insignia **"100% Humano Verificado"** la otorga un usuario `ADMIN` (`POST /api/artists/:artistId/verify-human`). Para crear el primer admin: `UPDATE users SET role='ADMIN' WHERE username='...'`.
+- El equipo de moderación se define con `ADMIN_EMAILS` y trabaja desde `/admin` (incluida la insignia **"100% Humano Verificado"**).
 - Drizzle Studio: `pnpm db:studio`.
 
 ---
